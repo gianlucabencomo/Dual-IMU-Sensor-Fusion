@@ -16,6 +16,9 @@ typedef struct {
     int16_t gx, gy, gz;
 } IMUData;
 
+#define ACCEL_SCALE 16384.0
+#define GYRO_SCALE  131.0
+
 void read_imu(int addr, IMUData *data) {
     uint8_t buffer[14];
     uint8_t start_reg = ACCEL_XOUT_H;
@@ -62,25 +65,39 @@ int main() {
         return 1;
     }
 
-    init_imu(IMU1_ADDR); // 0x68
-    init_imu(IMU2_ADDR); // 0x69
+    init_imu(IMU1_ADDR); 
+    init_imu(IMU2_ADDR); 
 
-    printf("Starting Raw Read (20Hz loop)...\n");
-    printf("IMU1 (0x68) Accel X | IMU2 (0x69) Accel X\n");
-    printf("-----------------------------------------\n");
+    printf("IMU Dual-Sensor Data Stream (20Hz)\n");
+    printf("Format: [Accel X,Y,Z in G] | [Gyro X,Y,Z in deg/s]\n");
+    printf("--------------------------------------------------------------------------------\n");
 
     while (1) {
         read_imu(IMU1_ADDR, &imu1);
         read_imu(IMU2_ADDR, &imu2);
 
-        // Raw LSB divided by 16384 for +/- 2g range
-        float ax1 = imu1.ax / 16384.0;
-        float ax2 = imu2.ax / 16384.0;
+        // --- IMU 1 Calculations ---
+        float ax1 = imu1.ax / ACCEL_SCALE;
+        float ay1 = imu1.ay / ACCEL_SCALE;
+        float az1 = imu1.az / ACCEL_SCALE;
+        float gx1 = imu1.gx / GYRO_SCALE;
+        float gy1 = imu1.gy / GYRO_SCALE;
+        float gz1 = imu1.gz / GYRO_SCALE;
 
-        printf("\r %8.2f G      |  %8.2f G      ", ax1, ax2);
-        fflush(stdout);
+        // --- IMU 2 Calculations ---
+        float ax2 = imu2.ax / ACCEL_SCALE;
+        float ay2 = imu2.ay / ACCEL_SCALE;
+        float az2 = imu2.az / ACCEL_SCALE;
+        float gx2 = imu2.gx / GYRO_SCALE;
+        float gy2 = imu2.gy / GYRO_SCALE;
+        float gz2 = imu2.gz / GYRO_SCALE;
+
+        // Displaying X-axis for both as a quick summary, or you can expand
+        printf("\rIMU1: A(%5.2f,%5.2f,%5.2f) G G(%7.1f,%7.1f,%7.1f) d/s | IMU2: A(%5.2f,%5.2f,%5.2f) G", 
+                ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2);
         
-        usleep(50000); // Wait 50ms
+        fflush(stdout);
+        usleep(50000); 
     }
     return 0;
 }
