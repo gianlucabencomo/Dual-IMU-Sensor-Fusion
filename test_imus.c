@@ -5,63 +5,82 @@
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
 #include <stdint.h>
+#include "mpu6050.h"
 
 int file;
 const char *bus = "/dev/i2c-1";
 
-// Register Addresses
-#define PWR_MGMT_1 0x6B
-#define ACCEL_XOUT_H 0x3B
+typedef struct {
+    int16_t ax, ay, az;
+    int16_t temp;
+    int16_t gx, gy, gz;
+} IMUData;
+
+void read_imu(int addr, IMUData *data) {
+    uint8_t buffer[14];
+    uint8_t start_reg = ACCEL_XOUT_H;
+
+    // Switch to the correct device address first!
+    if (ioctl(file, I2C_SLAVE, addr) < 0) return;
+
+    write(file, &start_reg, 1);
+
+    if (read(file, buffer, 14) == 14) {
+        // Names must match the struct exactly: ax, ay, az...
+        data->ax = (int16_t)((buffer[0] << 8) | buffer[1]);
+        data->ay = (int16_t)((buffer[2] << 8) | buffer[3]);
+        data->az = (int16_t)((buffer[4] << 8) | buffer[5]);
+        data->temp = (int16_t)((buffer[6] << 8) | buffer[7]);
+        data->gx = (int16_t)((buffer[8] << 8) | buffer[9]);
+        data->gy = (int16_t)((buffer[10] << 8) | buffer[11]);
+        data->gz = (int16_t)((buffer[12] << 8) | buffer[13]);
+    }
+}
 
 void init_imu(int addr) {
     if (ioctl(file, I2C_SLAVE, addr) < 0) {
-        printf("Failed to acquire bus access to 0x%x\n", addr);
+        printf("Error: Could not select IMU at 0x%02x\n", addr);
         return;
     }
-    // Wake up the IMU (write 0 to the power management register)
-    uint8_t buf[2] = {PWR_MGMT_1, 0};
-    write(file, buf, 2);
-}
+    
+    uint8_t wake_buf[2] = {PWR_MGMT_1, 0x00};
+    write(file, wake_buf, 2);
 
-int16_t read_sensor(int addr, uint8_t reg) {
-    uint8_t buf[2];
-    
-    // Set the address we want to talk to
-    ioctl(file, I2C_SLAVE, addr);
-    
-    // Tell the sensor which register we want to read
-    write(file, &reg, 1);
-    
-    // Read 2 bytes of data
-    if (read(file, buf, 2) != 2) {
-        return 0;
-    }
-    
-    // Combine High and Low bytes
-    return (int16_t)((buf[0] << 8) | buf[1]);
+    uint8_t raw_conf[2] = {CONFIG, 0x00}; 
+    write(file, raw_conf, 2);
+
+    uint8_t rate_buf[2] = {SMPLRT_DIV, 0x00};
+    write(file, rate_buf, 2); 
 }
 
 int main() {
-    // Open the I2C bus
-    if ((file = open(bus, O_RDWR)) < 0) {
-        printf("Failed to open the bus.\n");
+    IMUData imu1, imu2;
+
+    file = open(bus, O_RDWR);
+    if (file < 0) {
+        perror("Failed to open I2C bus");
         return 1;
     }
 
-    init_imu(0x68);
-    init_imu(0x69);
+    init_imu(IMU1_ADDR); // 0x68
+    init_imu(IMU2_ADDR); // 0x69
 
-    printf("Reading Accel X (Ctrl+C to quit)\n");
-    printf("IMU1 (0x68) | IMU2 (0x69)\n");
+    printf("Starting Raw Read (20Hz loop)...\n");
+    printf("IMU1 (0x68) Accel X | IMU2 (0x69) Accel X\n");
+    printf("-----------------------------------------\n");
 
     while (1) {
-        int16_t val1 = read_sensor(0x68, ACCEL_XOUT_H);
-        int16_t val2 = read_sensor(0x69, ACCEL_XOUT_H);
+        read_imu(IMU1_ADDR, &imu1);
+        read_imu(IMU2_ADDR, &imu2);
 
-        printf("\r%11d | %11d", val1, val2);
+        // Raw LSB divided by 16384 for +/- 2g range
+        float ax1 = imu1.ax / 16384.0;
+        float ax2 = imu2.ax / 16384.0;
+
+        printf("\r %8.2f G      |  %8.2f G      ", ax1, ax2);
         fflush(stdout);
-        usleep(100000); // Sleep 100ms
+        
+        usleep(50000); // Wait 50ms
     }
-
     return 0;
 }
