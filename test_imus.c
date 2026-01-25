@@ -10,9 +10,6 @@
 int file;
 const char *bus = "/dev/i2c-1";
 
-// --- The Device Object ---
-// This struct holds everything unique to one sensor.
-// It acts as your "Software Buffer" holding the latest state.
 typedef struct {
     int addr;           // I2C Address
     float a_scale;      // Current Accel sensitivity divider
@@ -64,8 +61,9 @@ void setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dl
     uint8_t d_conf[2] = {CONFIG, dlpf};
     write(file, d_conf, 2);
     
-    // 5. Set Sample Rate Divider to 0 (Max Speed)
-    uint8_t rate[2] = {SMPLRT_DIV, 0x00};
+    // Base Clock is 1kHz because DLPF is ON.
+    // 1000 / (1 + 1) = 500Hz
+    uint8_t rate[2] = {SMPLRT_DIV, 0x01}; 
     write(file, rate, 2);
 
     printf("IMU 0x%02x Configured: A-Scale=%.1f, G-Scale=%.1f\n", dev->addr, dev->a_scale, dev->g_scale);
@@ -110,39 +108,38 @@ int main() {
         return 1;
     }
 
-    // --- SETUP: Define your Sensors here ---
-    // Create the struct instances
     MPU6050_Device imu1 = { .addr = IMU1_ADDR };
     MPU6050_Device imu2 = { .addr = IMU2_ADDR };
 
-    // Configure IMU 1 (Standard Robot Settings)
-    // 4G Range, 500 deg/s Gyro, 44Hz Filter
-    setup_imu(&imu1, ACCEL_FS_4G, GYRO_FS_500, DLPF_44HZ);
+    setup_imu(&imu1, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ);
+    setup_imu(&imu2, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ);
 
-    // Configure IMU 2 (High Impact / Fast Spin Settings)
-    // 8G Range, 2000 deg/s Gyro, 94Hz Filter
-    setup_imu(&imu2, ACCEL_FS_8G, GYRO_FS_2000, DLPF_94HZ);
-
-    printf("\nReading All Sensors... Press Ctrl+C to stop.\n");
+    printf("\nReading All Sensors at 500Hz... Press Ctrl+C to stop.\n");
     
+    int counter = 0;
+
     while(1) {
-        // Pull buffer from hardware
+        // 1. Read Data (Happens 500 times a second)
         read_imu_data(&imu1);
         read_imu_data(&imu2);
 
-        // Print Unified Data
-        // \033[2J clears screen, \033[H moves cursor to top (Linux/Unix terminal codes)
-        printf("\033[2J\033[H"); 
-        
-        printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", imu1.temp_c);
-        printf("ACCEL (G):  X:%6.2f  Y:%6.2f  Z:%6.2f\n", imu1.ax_g, imu1.ay_g, imu1.az_g);
-        printf("GYRO (d/s): X:%6.1f  Y:%6.1f  Z:%6.1f\n", imu1.gx_ds, imu1.gy_ds, imu1.gz_ds);
-        
-        printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", imu2.temp_c);
-        printf("ACCEL (G):  X:%6.2f  Y:%6.2f  Z:%6.2f\n", imu2.ax_g, imu2.ay_g, imu2.az_g);
-        printf("GYRO (d/s): X:%6.1f  Y:%6.1f  Z:%6.1f\n", imu2.gx_ds, imu2.gy_ds, imu2.gz_ds);
+        // 2. Visual Output (Happens only 10 times a second)
+        // We do this to prevent the terminal from flickering unreadably
+        if (counter % 50 == 0) {
+            printf("\033[2J\033[H"); 
+            printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", imu1.temp_c);
+            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", imu1.ax_g, imu1.ay_g, imu1.az_g);
+            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", imu1.gx_ds, imu1.gy_ds, imu1.gz_ds);
+            
+            printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", imu2.temp_c);
+            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", imu2.ax_g, imu2.ay_g, imu2.az_g);
+            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", imu2.gx_ds, imu2.gy_ds, imu2.gz_ds);
+        }
 
-        usleep(100000); // 10Hz Refresh for readability
+        counter++;
+        
+        // 3. Sleep for 2ms (1 sec / 500 = 0.002 sec = 2000 us)
+        usleep(2000); 
     }
 
     return 0;
