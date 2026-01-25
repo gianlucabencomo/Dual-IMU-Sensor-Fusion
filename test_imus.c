@@ -10,94 +10,140 @@
 int file;
 const char *bus = "/dev/i2c-1";
 
+// --- The Device Object ---
+// This struct holds everything unique to one sensor.
+// It acts as your "Software Buffer" holding the latest state.
 typedef struct {
-    int16_t ax, ay, az;
-    int16_t temp;
-    int16_t gx, gy, gz;
-} IMUData;
+    int addr;           // I2C Address
+    float a_scale;      // Current Accel sensitivity divider
+    float g_scale;      // Current Gyro sensitivity divider
+    
+    // Processed Data
+    float ax_g, ay_g, az_g;
+    float gx_ds, gy_ds, gz_ds;
+    float temp_c;
+} MPU6050_Device;
 
-#define ACCEL_SCALE 16384.0
-#define GYRO_SCALE  131.0
+// Function to configure a specific IMU
+void setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlpf) {
+    if (ioctl(file, I2C_SLAVE, dev->addr) < 0) {
+        printf("Failed to connect to IMU at 0x%02x\n", dev->addr);
+        return;
+    }
 
-void read_imu(int addr, IMUData *data) {
-    uint8_t buffer[14];
+    // 1. Wake Up
+    uint8_t wake[2] = {PWR_MGMT_1, 0x00};
+    write(file, wake, 2);
+
+    // 2. Set Accelerometer Range
+    uint8_t a_conf[2] = {ACCEL_CONFIG, a_range};
+    write(file, a_conf, 2);
+
+    // Set the internal math scale based on your choice
+    switch(a_range) {
+        case ACCEL_FS_2G:  dev->a_scale = 16384.0; break;
+        case ACCEL_FS_4G:  dev->a_scale = 8192.0;  break;
+        case ACCEL_FS_8G:  dev->a_scale = 4096.0;  break;
+        case ACCEL_FS_16G: dev->a_scale = 2048.0;  break;
+        default: dev->a_scale = 16384.0;
+    }
+
+    // 3. Set Gyro Range
+    uint8_t g_conf[2] = {GYRO_CONFIG, g_range};
+    write(file, g_conf, 2);
+
+    switch(g_range) {
+        case GYRO_FS_250:  dev->g_scale = 131.0; break;
+        case GYRO_FS_500:  dev->g_scale = 65.5;  break;
+        case GYRO_FS_1000: dev->g_scale = 32.8;  break;
+        case GYRO_FS_2000: dev->g_scale = 16.4;  break;
+        default: dev->g_scale = 131.0;
+    }
+
+    // 4. Set DLPF (Bandwidth)
+    uint8_t d_conf[2] = {CONFIG, dlpf};
+    write(file, d_conf, 2);
+    
+    // 5. Set Sample Rate Divider to 0 (Max Speed)
+    uint8_t rate[2] = {SMPLRT_DIV, 0x00};
+    write(file, rate, 2);
+
+    printf("IMU 0x%02x Configured: A-Scale=%.1f, G-Scale=%.1f\n", dev->addr, dev->a_scale, dev->g_scale);
+}
+
+// Function to read all data into the device struct
+void read_imu_data(MPU6050_Device *dev) {
+    uint8_t buffer[14]; // The "Hardware Buffer"
     uint8_t start_reg = ACCEL_XOUT_H;
 
-    // Switch to the correct device address first!
-    if (ioctl(file, I2C_SLAVE, addr) < 0) return;
+    if (ioctl(file, I2C_SLAVE, dev->addr) < 0) return;
 
     write(file, &start_reg, 1);
 
     if (read(file, buffer, 14) == 14) {
-        // Names must match the struct exactly: ax, ay, az...
-        data->ax = (int16_t)((buffer[0] << 8) | buffer[1]);
-        data->ay = (int16_t)((buffer[2] << 8) | buffer[3]);
-        data->az = (int16_t)((buffer[4] << 8) | buffer[5]);
-        data->temp = (int16_t)((buffer[6] << 8) | buffer[7]);
-        data->gx = (int16_t)((buffer[8] << 8) | buffer[9]);
-        data->gy = (int16_t)((buffer[10] << 8) | buffer[11]);
-        data->gz = (int16_t)((buffer[12] << 8) | buffer[13]);
+        // 1. Raw Byte Assembly
+        int16_t raw_ax = (buffer[0] << 8) | buffer[1];
+        int16_t raw_ay = (buffer[2] << 8) | buffer[3];
+        int16_t raw_az = (buffer[4] << 8) | buffer[5];
+        int16_t raw_temp = (buffer[6] << 8) | buffer[7];
+        int16_t raw_gx = (buffer[8] << 8) | buffer[9];
+        int16_t raw_gy = (buffer[10] << 8) | buffer[11];
+        int16_t raw_gz = (buffer[12] << 8) | buffer[13];
+
+        // 2. Conversion to Real Units (using the stored scales)
+        dev->ax_g = raw_ax / dev->a_scale;
+        dev->ay_g = raw_ay / dev->a_scale;
+        dev->az_g = raw_az / dev->a_scale;
+
+        dev->temp_c = (raw_temp / 340.0) + 36.53;
+
+        dev->gx_ds = raw_gx / dev->g_scale;
+        dev->gy_ds = raw_gy / dev->g_scale;
+        dev->gz_ds = raw_gz / dev->g_scale;
     }
-}
-
-void init_imu(int addr) {
-    if (ioctl(file, I2C_SLAVE, addr) < 0) {
-        printf("Error: Could not select IMU at 0x%02x\n", addr);
-        return;
-    }
-    
-    uint8_t wake_buf[2] = {PWR_MGMT_1, 0x00};
-    write(file, wake_buf, 2);
-
-    uint8_t raw_conf[2] = {CONFIG, 0x00}; 
-    write(file, raw_conf, 2);
-
-    uint8_t rate_buf[2] = {SMPLRT_DIV, 0x00};
-    write(file, rate_buf, 2); 
 }
 
 int main() {
-    IMUData imu1, imu2;
-
     file = open(bus, O_RDWR);
     if (file < 0) {
-        perror("Failed to open I2C bus");
+        perror("Failed to open I2C");
         return 1;
     }
 
-    init_imu(IMU1_ADDR); 
-    init_imu(IMU2_ADDR); 
+    // --- SETUP: Define your Sensors here ---
+    // Create the struct instances
+    MPU6050_Device imu1 = { .addr = IMU1_ADDR };
+    MPU6050_Device imu2 = { .addr = IMU2_ADDR };
 
-    printf("IMU Dual-Sensor Data Stream (20Hz)\n");
-    printf("Format: [Accel X,Y,Z in G] | [Gyro X,Y,Z in deg/s]\n");
-    printf("--------------------------------------------------------------------------------\n");
+    // Configure IMU 1 (Standard Robot Settings)
+    // 4G Range, 500 deg/s Gyro, 44Hz Filter
+    setup_imu(&imu1, ACCEL_FS_4G, GYRO_FS_500, DLPF_44HZ);
 
-    while (1) {
-        read_imu(IMU1_ADDR, &imu1);
-        read_imu(IMU2_ADDR, &imu2);
+    // Configure IMU 2 (High Impact / Fast Spin Settings)
+    // 8G Range, 2000 deg/s Gyro, 94Hz Filter
+    setup_imu(&imu2, ACCEL_FS_8G, GYRO_FS_2000, DLPF_94HZ);
 
-        // --- IMU 1 Calculations ---
-        float ax1 = imu1.ax / ACCEL_SCALE;
-        float ay1 = imu1.ay / ACCEL_SCALE;
-        float az1 = imu1.az / ACCEL_SCALE;
-        float gx1 = imu1.gx / GYRO_SCALE;
-        float gy1 = imu1.gy / GYRO_SCALE;
-        float gz1 = imu1.gz / GYRO_SCALE;
+    printf("\nReading All Sensors... Press Ctrl+C to stop.\n");
+    
+    while(1) {
+        // Pull buffer from hardware
+        read_imu_data(&imu1);
+        read_imu_data(&imu2);
 
-        // --- IMU 2 Calculations ---
-        float ax2 = imu2.ax / ACCEL_SCALE;
-        float ay2 = imu2.ay / ACCEL_SCALE;
-        float az2 = imu2.az / ACCEL_SCALE;
-        float gx2 = imu2.gx / GYRO_SCALE;
-        float gy2 = imu2.gy / GYRO_SCALE;
-        float gz2 = imu2.gz / GYRO_SCALE;
-
-        // Displaying X-axis for both as a quick summary, or you can expand
-        printf("\rIMU1: A(%5.2f,%5.2f,%5.2f) G G(%7.1f,%7.1f,%7.1f) d/s | IMU2: A(%5.2f,%5.2f,%5.2f) G", 
-                ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2);
+        // Print Unified Data
+        // \033[2J clears screen, \033[H moves cursor to top (Linux/Unix terminal codes)
+        printf("\033[2J\033[H"); 
         
-        fflush(stdout);
-        usleep(50000); 
+        printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", imu1.temp_c);
+        printf("ACCEL (G):  X:%6.2f  Y:%6.2f  Z:%6.2f\n", imu1.ax_g, imu1.ay_g, imu1.az_g);
+        printf("GYRO (d/s): X:%6.1f  Y:%6.1f  Z:%6.1f\n", imu1.gx_ds, imu1.gy_ds, imu1.gz_ds);
+        
+        printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", imu2.temp_c);
+        printf("ACCEL (G):  X:%6.2f  Y:%6.2f  Z:%6.2f\n", imu2.ax_g, imu2.ay_g, imu2.az_g);
+        printf("GYRO (d/s): X:%6.1f  Y:%6.1f  Z:%6.1f\n", imu2.gx_ds, imu2.gy_ds, imu2.gz_ds);
+
+        usleep(100000); // 10Hz Refresh for readability
     }
+
     return 0;
 }
