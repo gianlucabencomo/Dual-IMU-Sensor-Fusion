@@ -210,7 +210,7 @@ void sweep_dlpf_calibrations(MPU6050_Device *dev) {
     for(int d = 0; d < 7; d++) {
         setup_imu(dev, current_a_range, current_g_range, dlpfs[d], current_s_rate);
         
-        int num_samples = 1000;
+        int num_samples = 500;
         float sum_x = 0, sum_y = 0, sum_z = 0, sum_temp = 0;
         
         long target_ns = get_frame_dt_ns(dev->sample_rate);
