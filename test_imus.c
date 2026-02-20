@@ -105,6 +105,8 @@ void read_imu_data(MPU6050_Device *dev) {
         dev->gx_ds = (raw_gx / dev->g_scale) - dev->gx_offset;
         dev->gy_ds = (raw_gy / dev->g_scale) - dev->gy_offset;
         dev->gz_ds = (raw_gz / dev->g_scale) - dev->gz_offset;
+    } else {
+        printf("\n[WARNING] I2C Read Failed on IMU 0x%02x!\n", dev->addr);
     }
 }
 
@@ -132,20 +134,65 @@ void ensure_calib_dir_exists(int addr, uint8_t dlpf, int temp_bucket) {
 }
 
 int load_calibration(MPU6050_Device *dev) {
+    // Take one quick reading to get current hardware temperature
     read_imu_data(dev); 
-    int temp_bucket = ((int)dev->temp_c / 5) * 5;
     
+    // 1-degree buckets
+    int target_bucket = (int)dev->temp_c; 
     char filepath[128];
-    snprintf(filepath, sizeof(filepath), "calib/0x%02x/D%02x/%d/offsets.txt", 
-             dev->addr, dev->dlpf, temp_bucket);
+    FILE *f = NULL;
     
-    FILE *f = fopen(filepath, "r");
+    int actual_bucket = target_bucket;
+    int max_search_radius = 15; 
+    int found_distance = -1;
+
+    // Expanding search pattern: 0, -1, +1, -2, +2...
+    for (int offset = 0; offset <= max_search_radius; offset++) {
+        
+        // Try negative offset first
+        actual_bucket = target_bucket - offset;
+        snprintf(filepath, sizeof(filepath), "calib/0x%02x/D%02x/%d/offsets.txt", 
+                 dev->addr, dev->dlpf, actual_bucket);
+        f = fopen(filepath, "r");
+        if (f) {
+            found_distance = offset;
+            break;
+        }
+        
+        // Try positive offset
+        if (offset > 0) { 
+            actual_bucket = target_bucket + offset;
+            snprintf(filepath, sizeof(filepath), "calib/0x%02x/D%02x/%d/offsets.txt", 
+                     dev->addr, dev->dlpf, actual_bucket);
+            f = fopen(filepath, "r");
+            if (f) {
+                found_distance = offset;
+                break;
+            }
+        }
+    }
+    
+    // Evaluate what we found
     if (f) {
         fscanf(f, "%f %f %f %f", &dev->gx_offset, &dev->gy_offset, &dev->gz_offset, &dev->calib_temp);
         fclose(f);
-        return 1; 
+        
+        if (found_distance == 0) {
+            printf(">> Loaded exact config for IMU 0x%02x from %s\n", dev->addr, filepath);
+        } else if (found_distance <= 5) {
+            printf(">> Note: Temp %dC missing. Loaded nearby bucket (%dC) for IMU 0x%02x\n", 
+                   target_bucket, actual_bucket, dev->addr);
+        } else {
+            printf("\n[WARNING] IMU 0x%02x calibration is %d degrees off! (Target: %dC, Found: %dC).\n", 
+                   dev->addr, found_distance, target_bucket, actual_bucket);
+            printf("          Thermal drift may cause gyro errors. Recalibration recommended.\n\n");
+        }
+        return 1; // Success
     }
-    return 0; 
+    
+    printf(">> CRITICAL: No calibration found within %d degrees of %dC for IMU 0x%02x\n", 
+           max_search_radius, target_bucket, dev->addr);
+    return 0; // File not found
 }
 
 void sweep_dlpf_calibrations(MPU6050_Device *dev) {
@@ -196,7 +243,8 @@ void sweep_dlpf_calibrations(MPU6050_Device *dev) {
         dev->gy_offset = sum_y / num_samples;
         dev->gz_offset = sum_z / num_samples;
 
-        int temp_bucket = ((int)dev->calib_temp / 5) * 5;
+        // 1-degree bucket
+        int temp_bucket = (int)dev->calib_temp; 
         ensure_calib_dir_exists(dev->addr, dev->dlpf, temp_bucket);
 
         char filepath[128];
