@@ -1,9 +1,9 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <linux/i2c-dev.h>
+#include <i2c/smbus.h>   // NEW: The SMBus library for safe reads/writes
 #include <stdint.h>
 #include "mpu6050.h"
 
@@ -11,32 +11,37 @@ int file;
 const char *bus = "/dev/i2c-1";
 
 typedef struct {
-    int addr;           // I2C Address
-    float a_scale;      // Current Accel sensitivity divider
-    float g_scale;      // Current Gyro sensitivity divider
+    int addr;           
+    float a_scale;      
+    float g_scale;      
     
-    // Processed Data
     float ax_g, ay_g, az_g;
     float gx_ds, gy_ds, gz_ds;
     float temp_c;
 } MPU6050_Device;
 
-// Function to configure a specific IMU
-void setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlpf) {
+// Setup function now returns 1 for success, 0 for failure
+int setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlpf) {
+    // Connect the OS switchboard to this specific IMU
     if (ioctl(file, I2C_SLAVE, dev->addr) < 0) {
-        printf("Failed to connect to IMU at 0x%02x\n", dev->addr);
-        return;
+        printf("System Error: Failed to connect to I2C bus for IMU at 0x%02x\n", dev->addr);
+        return 0;
     }
 
-    // 1. Wake Up
-    uint8_t wake[2] = {PWR_MGMT_1, 0x00};
-    write(file, wake, 2);
+    // --- 1. PROBING & VERIFICATION ---
+    int who_am_i = i2c_smbus_read_byte_data(file, WHO_AM_I);
+    if (who_am_i != 0x68) {
+        printf("Hardware Error: IMU at 0x%02x returned WHO_AM_I = 0x%02x (Expected 0x68). Check wiring!\n", dev->addr, who_am_i);
+        return 0; 
+    }
+    printf("IMU at 0x%02x successfully detected.\n", dev->addr);
 
-    // 2. Set Accelerometer Range
-    uint8_t a_conf[2] = {ACCEL_CONFIG, a_range};
-    write(file, a_conf, 2);
+    // --- 2. CONFIGURATION (Using safe SMBus writes) ---
+    // Wake Up
+    i2c_smbus_write_byte_data(file, PWR_MGMT_1, 0x00);
 
-    // Set the internal math scale based on your choice
+    // Set Accelerometer Range
+    i2c_smbus_write_byte_data(file, ACCEL_CONFIG, a_range);
     switch(a_range) {
         case ACCEL_FS_2G:  dev->a_scale = 16384.0; break;
         case ACCEL_FS_4G:  dev->a_scale = 8192.0;  break;
@@ -45,10 +50,8 @@ void setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dl
         default: dev->a_scale = 16384.0;
     }
 
-    // 3. Set Gyro Range
-    uint8_t g_conf[2] = {GYRO_CONFIG, g_range};
-    write(file, g_conf, 2);
-
+    // Set Gyro Range
+    i2c_smbus_write_byte_data(file, GYRO_CONFIG, g_range);
     switch(g_range) {
         case GYRO_FS_250:  dev->g_scale = 131.0; break;
         case GYRO_FS_500:  dev->g_scale = 65.5;  break;
@@ -57,29 +60,25 @@ void setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dl
         default: dev->g_scale = 131.0;
     }
 
-    // 4. Set DLPF (Bandwidth)
-    uint8_t d_conf[2] = {CONFIG, dlpf};
-    write(file, d_conf, 2);
-    
-    // Base Clock is 1kHz because DLPF is ON.
-    // 1000 / (1 + 1) = 500Hz
-    uint8_t rate[2] = {SMPLRT_DIV, 0x01}; 
-    write(file, rate, 2);
+    // Set DLPF (Bandwidth) and Sample Rate
+    i2c_smbus_write_byte_data(file, CONFIG, dlpf);
+    i2c_smbus_write_byte_data(file, SMPLRT_DIV, 0x01); 
 
     printf("IMU 0x%02x Configured: A-Scale=%.1f, G-Scale=%.1f\n", dev->addr, dev->a_scale, dev->g_scale);
+    return 1;
 }
 
-// Function to read all data into the device struct
+// Function to read all data safely
 void read_imu_data(MPU6050_Device *dev) {
-    uint8_t buffer[14]; // The "Hardware Buffer"
-    uint8_t start_reg = ACCEL_XOUT_H;
+    uint8_t buffer[14]; 
 
+    // Connect to this specific IMU
     if (ioctl(file, I2C_SLAVE, dev->addr) < 0) return;
 
-    write(file, &start_reg, 1);
-
-    if (read(file, buffer, 14) == 14) {
-        // 1. Raw Byte Assembly
+    // --- ATOMIC BURST READ ---
+    // This locks the bus, writes the start register, and reads 14 bytes in one uninterruptible motion
+    if (i2c_smbus_read_i2c_block_data(file, ACCEL_XOUT_H, 14, buffer) == 14) {
+        
         int16_t raw_ax = (buffer[0] << 8) | buffer[1];
         int16_t raw_ay = (buffer[2] << 8) | buffer[3];
         int16_t raw_az = (buffer[4] << 8) | buffer[5];
@@ -88,7 +87,6 @@ void read_imu_data(MPU6050_Device *dev) {
         int16_t raw_gy = (buffer[10] << 8) | buffer[11];
         int16_t raw_gz = (buffer[12] << 8) | buffer[13];
 
-        // 2. Conversion to Real Units (using the stored scales)
         dev->ax_g = raw_ax / dev->a_scale;
         dev->ay_g = raw_ay / dev->a_scale;
         dev->az_g = raw_az / dev->a_scale;
@@ -104,27 +102,27 @@ void read_imu_data(MPU6050_Device *dev) {
 int main() {
     file = open(bus, O_RDWR);
     if (file < 0) {
-        perror("Failed to open I2C");
+        perror("Failed to open I2C bus");
         return 1;
     }
 
     MPU6050_Device imu1 = { .addr = IMU1_ADDR };
     MPU6050_Device imu2 = { .addr = IMU2_ADDR };
 
-    setup_imu(&imu1, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ);
-    setup_imu(&imu2, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ);
+    printf("--- Initializing Hardware ---\n");
+    
+    // Check if initialization failed. If either fails, safely exit.
+    if (!setup_imu(&imu1, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ)) return 1;
+    if (!setup_imu(&imu2, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ)) return 1;
 
     printf("\nReading All Sensors at 500Hz... Press Ctrl+C to stop.\n");
     
     int counter = 0;
 
     while(1) {
-        // 1. Read Data (Happens 500 times a second)
         read_imu_data(&imu1);
         read_imu_data(&imu2);
 
-        // 2. Visual Output (Happens only 10 times a second)
-        // We do this to prevent the terminal from flickering unreadably
         if (counter % 50 == 0) {
             printf("\033[2J\033[H"); 
             printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", imu1.temp_c);
@@ -137,8 +135,6 @@ int main() {
         }
 
         counter++;
-        
-        // 3. Sleep for 2ms (1 sec / 500 = 0.002 sec = 2000 us)
         usleep(2000); 
     }
 
