@@ -88,3 +88,8 @@ Min/Max Scanning (also called Tumble Calibration).
 
 How to do sensor fusion on position that is not directly where the IMUs are
     - use Rigid Body Kinematics
+
+
+1. Probing and Verification (The Handshake)
+2. Calibration
+3.  

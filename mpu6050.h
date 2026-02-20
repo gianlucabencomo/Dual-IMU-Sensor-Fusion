@@ -40,4 +40,10 @@
 #define DLPF_10HZ    0x05
 #define DLPF_5HZ     0x06
 
+// Sampling Rate
+#define SAMPLE_1000HZ 0x00
+#define SAMPLE_500HZ 0x01
+#define SAMPLE_250HZ 0x03
+#define SAMPLE_100HZ 0x09
+
 #endif
