@@ -5,6 +5,8 @@
 #include <linux/i2c-dev.h>
 #include <i2c/smbus.h>
 #include <stdint.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "mpu6050.h"
 
 int file;
@@ -14,27 +16,37 @@ typedef struct {
     int addr;           
     float a_scale;      
     float g_scale;      
-    
-    // --- NEW: Calibration Offsets ---
-    float gx_offset, gy_offset, gz_offset;
 
+    // Configuration State
+    uint8_t a_range;
+    uint8_t g_range;
+    uint8_t dlpf;
+    
+    // Calibration Offsets & Temp
+    float gx_offset, gy_offset, gz_offset;
+    float calib_temp;
+
+    // Processed Data
     float ax_g, ay_g, az_g;
     float gx_ds, gy_ds, gz_ds;
     float temp_c;
 } MPU6050_Device;
 
+// --- 1. HARDWARE SETUP ---
 int setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlpf) {
     if (ioctl(file, I2C_SLAVE, dev->addr) < 0) {
         printf("System Error: Failed to connect to I2C bus for IMU at 0x%02x\n", dev->addr);
         return 0;
     }
 
+    // Probing
     int who_am_i = i2c_smbus_read_byte_data(file, WHO_AM_I);
     if (who_am_i != 0x68) {
         printf("Hardware Error: IMU at 0x%02x returned WHO_AM_I = 0x%02x (Expected 0x68). Check wiring!\n", dev->addr, who_am_i);
         return 0; 
     }
     
+    // Initialization
     i2c_smbus_write_byte_data(file, PWR_MGMT_1, 0x00);
     i2c_smbus_write_byte_data(file, ACCEL_CONFIG, a_range);
     
@@ -58,14 +70,19 @@ int setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlp
     i2c_smbus_write_byte_data(file, CONFIG, dlpf);
     i2c_smbus_write_byte_data(file, SMPLRT_DIV, 0x01); 
 
-    // Initialize offsets to zero by default
+    // Store configuration state
+    dev->a_range = a_range;
+    dev->g_range = g_range;
+    dev->dlpf = dlpf;
+
+    // Initialize offsets to zero so initial temp reads don't use garbage memory
     dev->gx_offset = 0; dev->gy_offset = 0; dev->gz_offset = 0;
 
     printf("IMU 0x%02x Configured: A-Scale=%.1f, G-Scale=%.1f\n", dev->addr, dev->a_scale, dev->g_scale);
     return 1;
 }
 
-// Function to read data (Now includes offset subtraction)
+// --- 2. DATA ACQUISITION ---
 void read_imu_data(MPU6050_Device *dev) {
     uint8_t buffer[14]; 
 
@@ -86,23 +103,65 @@ void read_imu_data(MPU6050_Device *dev) {
 
         dev->temp_c = (raw_temp / 340.0) + 36.53;
 
-        // --- NEW: Subtract the loaded offsets to zero out the gyro ---
+        // Subtract offsets to zero out the gyro
         dev->gx_ds = (raw_gx / dev->g_scale) - dev->gx_offset;
         dev->gy_ds = (raw_gy / dev->g_scale) - dev->gy_offset;
         dev->gz_ds = (raw_gz / dev->g_scale) - dev->gz_offset;
     }
 }
 
-// --- NEW: Calibration Functions ---
+// --- 3. CALIBRATION & DIRECTORIES ---
+void ensure_calib_dir_exists(int addr, uint8_t g_range, uint8_t dlpf, int temp_bucket) {
+    struct stat st = {0};
+    char path[128];
+    
+    // calib/
+    if (stat("calib", &st) == -1) mkdir("calib", 0777);
+    
+    // calib/0x68/
+    snprintf(path, sizeof(path), "calib/0x%02x", addr);
+    if (stat(path, &st) == -1) mkdir(path, 0777);
+    
+    // calib/0x68/G10_D02/
+    snprintf(path, sizeof(path), "calib/0x%02x/G%02x_D%02x", addr, g_range, dlpf);
+    if (stat(path, &st) == -1) mkdir(path, 0777);
+
+    // calib/0x68/G10_D02/25/
+    snprintf(path, sizeof(path), "calib/0x%02x/G%02x_D%02x/%d", addr, g_range, dlpf, temp_bucket);
+    if (stat(path, &st) == -1) mkdir(path, 0777);
+}
+
+int load_calibration(MPU6050_Device *dev) {
+    // Take one quick reading just to get the current temperature
+    read_imu_data(dev); 
+    
+    // Calculate the 5-degree bucket (e.g., 23.4C -> 20, 26.1C -> 25)
+    int temp_bucket = ((int)dev->temp_c / 5) * 5;
+    
+    char filepath[128];
+    snprintf(filepath, sizeof(filepath), "calib/0x%02x/G%02x_D%02x/%d/offsets.txt", 
+             dev->addr, dev->g_range, dev->dlpf, temp_bucket);
+    
+    FILE *f = fopen(filepath, "r");
+    if (f) {
+        fscanf(f, "%f %f %f %f", &dev->gx_offset, &dev->gy_offset, &dev->gz_offset, &dev->calib_temp);
+        fclose(f);
+        printf(">> Loaded config for 0x%02x from %s\n", dev->addr, filepath);
+        return 1; 
+    }
+    
+    printf(">> No calibration found at %s\n", filepath);
+    return 0; // File not found, needs calibration
+}
 
 void calibrate_gyro(MPU6050_Device *dev) {
     printf(">> Calibrating IMU 0x%02x. DO NOT MOVE SENSOR...\n", dev->addr);
-    sleep(2); // Give the user 2 seconds to take their hands off the table
+    sleep(2); 
 
     int num_samples = 1000;
-    float sum_x = 0, sum_y = 0, sum_z = 0;
+    float sum_x = 0, sum_y = 0, sum_z = 0, sum_temp = 0;
 
-    // Temporarily clear offsets so we read pure hardware data
+    // Temporarily clear offsets to read pure hardware drift
     dev->gx_offset = 0; dev->gy_offset = 0; dev->gz_offset = 0;
 
     for (int i = 0; i < num_samples; i++) {
@@ -110,43 +169,35 @@ void calibrate_gyro(MPU6050_Device *dev) {
         sum_x += dev->gx_ds;
         sum_y += dev->gy_ds;
         sum_z += dev->gz_ds;
-        usleep(2000); // Wait 2ms (500Hz)
+        sum_temp += dev->temp_c;
+        usleep(2000); 
     }
 
-    // Calculate the average drift
+    // Calculate averages
+    dev->calib_temp = sum_temp / num_samples;
     dev->gx_offset = sum_x / num_samples;
     dev->gy_offset = sum_y / num_samples;
     dev->gz_offset = sum_z / num_samples;
 
-    // Save to a text file specific to this I2C address
-    char filename[32];
-    snprintf(filename, sizeof(filename), "imu_cal_0x%02x.txt", dev->addr);
-    FILE *f = fopen(filename, "w");
+    // Figure out which bucket this belongs in and build the folder tree
+    int temp_bucket = ((int)dev->calib_temp / 5) * 5;
+    ensure_calib_dir_exists(dev->addr, dev->g_range, dev->dlpf, temp_bucket);
+
+    char filepath[128];
+    snprintf(filepath, sizeof(filepath), "calib/0x%02x/G%02x_D%02x/%d/offsets.txt", 
+             dev->addr, dev->g_range, dev->dlpf, temp_bucket);
+             
+    FILE *f = fopen(filepath, "w");
     if (f) {
-        fprintf(f, "%f %f %f\n", dev->gx_offset, dev->gy_offset, dev->gz_offset);
+        fprintf(f, "%f %f %f %f\n", dev->gx_offset, dev->gy_offset, dev->gz_offset, dev->calib_temp);
         fclose(f);
-        printf(">> Saved offsets for 0x%02x: X:%.2f Y:%.2f Z:%.2f\n", dev->addr, dev->gx_offset, dev->gy_offset, dev->gz_offset);
+        printf(">> Saved offsets for 0x%02x to %s\n", dev->addr, filepath);
     } else {
-        printf(">> Error: Could not save calibration file for 0x%02x.\n", dev->addr);
+        printf(">> Error: Could not save calibration file %s\n", filepath);
     }
 }
 
-int load_calibration(MPU6050_Device *dev) {
-    char filename[32];
-    snprintf(filename, sizeof(filename), "imu_cal_0x%02x.txt", dev->addr);
-    
-    FILE *f = fopen(filename, "r");
-    if (f) {
-        fscanf(f, "%f %f %f", &dev->gx_offset, &dev->gy_offset, &dev->gz_offset);
-        fclose(f);
-        printf(">> Loaded saved calibration for 0x%02x.\n", dev->addr);
-        return 1; // Success
-    }
-    return 0; // File not found
-}
-
-// ----------------------------------
-
+// --- 4. MAIN LOOP ---
 int main() {
     file = open(bus, O_RDWR);
     if (file < 0) {
@@ -162,7 +213,6 @@ int main() {
     if (!setup_imu(&imu2, ACCEL_FS_8G, GYRO_FS_1000, DLPF_94HZ)) return 1;
 
     printf("\n--- Gyroscope Calibration ---\n");
-    // Try to load the file. If it fails (returns 0), run the calibration routine.
     if (!load_calibration(&imu1)) calibrate_gyro(&imu1);
     if (!load_calibration(&imu2)) calibrate_gyro(&imu2);
 
