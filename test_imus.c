@@ -195,31 +195,41 @@ int load_calibration(MPU6050_Device *dev) {
     return 0; // File not found
 }
 
-void sweep_dlpf_calibrations(MPU6050_Device *dev) {
-    printf("\n>>> STARTING DLPF SWEEP FOR IMU 0x%02x <<<\n", dev->addr);
-    printf("DO NOT MOVE SENSOR. This will take ~15 seconds...\n\n");
+void sweep_dual_calibrations(MPU6050_Device *devs, int num_devs) {
+    printf("\n>>> STARTING SIMULTANEOUS DLPF SWEEP FOR %d IMUs <<<\n", num_devs);
+    printf("DO NOT MOVE SENSORS. Capturing thermal snapshots...\n\n");
     sleep(3);
 
     uint8_t dlpfs[] = {DLPF_260HZ, DLPF_184HZ, DLPF_94HZ, DLPF_44HZ, DLPF_21HZ, DLPF_10HZ, DLPF_5HZ};
     
-    // Lock in the run configurations so we don't accidentally sweep ranges
-    uint8_t current_a_range = dev->a_range;
-    uint8_t current_g_range = dev->g_range;
-    uint8_t current_s_rate = dev->sample_rate;
+    // Use the settings from the first device as the template for the sweep
+    uint8_t a_r = devs[0].a_range;
+    uint8_t g_r = devs[0].g_range;
+    uint8_t s_r = devs[0].sample_rate;
 
     for(int d = 0; d < 7; d++) {
-        setup_imu(dev, current_a_range, current_g_range, dlpfs[d], current_s_rate);
-        
+        // 1. Setup all devices for this DLPF
+        for(int j = 0; j < num_devs; j++) {
+            setup_imu(&devs[j], a_r, g_r, dlpfs[d], s_r);
+        }
+
         int num_samples = 500;
-        float sum_x = 0, sum_y = 0, sum_z = 0, sum_temp = 0;
+        float sum_x[num_devs], sum_y[num_devs], sum_z[num_devs], sum_temp[num_devs];
         
-        long target_ns = get_frame_dt_ns(dev->sample_rate);
+        // Initialize sums
+        for(int j=0; j<num_devs; j++) {
+            sum_x[j] = sum_y[j] = sum_z[j] = sum_temp[j] = 0;
+            devs[j].gx_offset = devs[j].gy_offset = devs[j].gz_offset = 0; // Clear offsets for raw read
+        }
+
+        long target_ns = get_frame_dt_ns(s_r);
         struct timespec start, now;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
         printf("[%d/7] Sweeping DLPF: 0x%02x... ", d+1, dlpfs[d]);
         fflush(stdout);
 
+        // 2. Parallel Precision Collection
         for (int i = 0; i < num_samples; i++) {
             do {
                 clock_gettime(CLOCK_MONOTONIC, &now);
@@ -231,37 +241,42 @@ void sweep_dlpf_calibrations(MPU6050_Device *dev) {
                 start.tv_sec += 1;
             }
 
-            read_imu_data(dev);
-            sum_x += dev->gx_ds;
-            sum_y += dev->gy_ds;
-            sum_z += dev->gz_ds;
-            sum_temp += dev->temp_c;
+            // Read from all devices in the same time slice
+            for(int j=0; j < num_devs; j++) {
+                read_imu_data(&devs[j]);
+                sum_x[j] += devs[j].gx_ds;
+                sum_y[j] += devs[j].gy_ds;
+                sum_z[j] += devs[j].gz_ds;
+                sum_temp[j] += devs[j].temp_c;
+            }
         }
 
-        dev->calib_temp = sum_temp / num_samples;
-        dev->gx_offset = sum_x / num_samples;
-        dev->gy_offset = sum_y / num_samples;
-        dev->gz_offset = sum_z / num_samples;
+        // 3. Save results for all devices
+        for(int j=0; j < num_devs; j++) {
+            devs[j].calib_temp = sum_temp[j] / num_samples;
+            devs[j].gx_offset = sum_x[j] / num_samples;
+            devs[j].gy_offset = sum_y[j] / num_samples;
+            devs[j].gz_offset = sum_z[j] / num_samples;
 
-        // 1-degree bucket
-        int temp_bucket = (int)dev->calib_temp; 
-        ensure_calib_dir_exists(dev->addr, dev->dlpf, temp_bucket);
+            int temp_bucket = (int)devs[j].calib_temp; 
+            ensure_calib_dir_exists(devs[j].addr, dlpfs[d], temp_bucket);
 
-        char filepath[128];
-        snprintf(filepath, sizeof(filepath), "calib/0x%02x/D%02x/%d/offsets.txt", 
-                 dev->addr, dev->dlpf, temp_bucket);
-                 
-        FILE *f = fopen(filepath, "w");
-        if (f) {
-            fprintf(f, "%f %f %f %f\n", dev->gx_offset, dev->gy_offset, dev->gz_offset, dev->calib_temp);
-            fclose(f);
-            printf("Done. Temp: %.1f C\n", dev->calib_temp);
+            char filepath[128];
+            snprintf(filepath, sizeof(filepath), "calib/0x%02x/D%02x/%d/offsets.txt", 
+                     devs[j].addr, dlpfs[d], temp_bucket);
+                     
+            FILE *f = fopen(filepath, "w");
+            if (f) {
+                fprintf(f, "%f %f %f %f\n", devs[j].gx_offset, devs[j].gy_offset, devs[j].gz_offset, devs[j].calib_temp);
+                fclose(f);
+            }
         }
+        printf("Done.\n");
     }
-    printf(">>> SWEEP COMPLETE FOR 0x%02x <<<\n\n", dev->addr);
+    printf(">>> DUAL SWEEP COMPLETE <<<\n\n");
 }
 
-// --- 5. MAIN LOOP ---
+// --- 5. UPDATED MAIN ---
 int main() {
     file = open(bus, O_RDWR);
     if (file < 0) {
@@ -271,28 +286,30 @@ int main() {
 
     MPU6050_Device imu1 = { .addr = IMU1_ADDR };
     MPU6050_Device imu2 = { .addr = IMU2_ADDR };
+    MPU6050_Device my_imus[2] = { imu1, imu2 };
 
-    // Set the configuration you ACTUALLY want to use for the main run
     uint8_t RUN_ACCEL = ACCEL_FS_8G;
     uint8_t RUN_GYRO  = GYRO_FS_1000;
     uint8_t RUN_DLPF  = DLPF_94HZ;
     uint8_t RUN_RATE  = SAMPLE_500HZ;
 
     printf("--- Initializing Hardware ---\n");
-    if (!setup_imu(&imu1, RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
-    if (!setup_imu(&imu2, RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
-
-    // Check for calibration file. If missing, sweep and reset.
-    if (!load_calibration(&imu1)) {
-        sweep_dlpf_calibrations(&imu1);
-        setup_imu(&imu1, RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
-        load_calibration(&imu1);
+    for(int i=0; i<2; i++) {
+        if (!setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
     }
-    
-    if (!load_calibration(&imu2)) {
-        sweep_dlpf_calibrations(&imu2);
-        setup_imu(&imu2, RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE); 
-        load_calibration(&imu2); 
+
+    printf("\n--- Gyroscope Calibration Check ---\n");
+    int imu1_ready = load_calibration(&my_imus[0]);
+    int imu2_ready = load_calibration(&my_imus[1]);
+
+    // If EITHER imu is missing calibration, run the sweep for both
+    if (!imu1_ready || !imu2_ready) {
+        sweep_dual_calibrations(my_imus, 2);
+        // Re-setup and reload after sweep
+        for(int i=0; i<2; i++) {
+            setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
+            load_calibration(&my_imus[i]);
+        }
     }
 
     printf("\nRunning Sensors at target rate. Press Ctrl+C to stop.\n");
@@ -303,7 +320,6 @@ int main() {
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    // The jitter-free main loop
     while(1) {
         do {
             clock_gettime(CLOCK_MONOTONIC, &now);
@@ -315,22 +331,20 @@ int main() {
             start.tv_sec += 1;
         }
 
-        read_imu_data(&imu1);
-        read_imu_data(&imu2);
+        read_imu_data(&my_imus[0]);
+        read_imu_data(&my_imus[1]);
 
         if (counter % 50 == 0) {
             printf("\033[2J\033[H"); 
-            printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", imu1.temp_c);
-            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", imu1.ax_g, imu1.ay_g, imu1.az_g);
-            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", imu1.gx_ds, imu1.gy_ds, imu1.gz_ds);
+            printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", my_imus[0].temp_c);
+            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", my_imus[0].ax_g, my_imus[0].ay_g, my_imus[0].az_g);
+            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[0].gx_ds, my_imus[0].gy_ds, my_imus[0].gz_ds);
             
-            printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", imu2.temp_c);
-            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", imu2.ax_g, imu2.ay_g, imu2.az_g);
-            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", imu2.gx_ds, imu2.gy_ds, imu2.gz_ds);
+            printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", my_imus[1].temp_c);
+            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", my_imus[1].ax_g, my_imus[1].ay_g, my_imus[1].az_g);
+            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[1].gx_ds, my_imus[1].gy_ds, my_imus[1].gz_ds);
         }
-
         counter++;
     }
-
     return 0;
 }
