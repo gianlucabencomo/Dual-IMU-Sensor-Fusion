@@ -293,7 +293,7 @@ void calibrate_gyro(MPU6050_Device *devs, int num_devs, int num_samples) {
     printf(">>> GYRO CALIBRATION COMPLETE <<<\n\n");
 }
 
-// --- 5. UPDATED MAIN ---
+// --- 5. EXHAUSTIVE TEST MAIN ---
 int main() {
     file = open(bus, O_RDWR);
     if (file < 0) {
@@ -305,66 +305,91 @@ int main() {
     MPU6050_Device imu2 = { .addr = IMU2_ADDR };
     MPU6050_Device my_imus[2] = { imu1, imu2 };
 
-    uint8_t RUN_ACCEL = ACCEL_FS_8G;
-    uint8_t RUN_GYRO  = GYRO_FS_1000;
-    uint8_t RUN_DLPF  = DLPF_94HZ;
-    uint8_t RUN_RATE  = SAMPLE_500HZ;
+    // --- Configuration Arrays ---
+    uint8_t a_ranges[] = {ACCEL_FS_2G, ACCEL_FS_4G, ACCEL_FS_8G, ACCEL_FS_16G};
+    const char* a_names[] = {"2G", "4G", "8G", "16G"};
 
-    printf("--- Initializing Hardware ---\n");
-    for(int i=0; i<2; i++) {
-        if (!setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
-    }
+    uint8_t g_ranges[] = {GYRO_FS_250, GYRO_FS_500, GYRO_FS_1000, GYRO_FS_2000};
+    const char* g_names[] = {"250dps", "500dps", "1000dps", "2000dps"};
 
-    printf("\n--- Gyroscope Calibration Check ---\n");
-    int imu1_ready = load_calibration(&my_imus[0]);
-    int imu2_ready = load_calibration(&my_imus[1]);
+    uint8_t dlpfs[] = {DLPF_260HZ, DLPF_184HZ, DLPF_94HZ, DLPF_44HZ, DLPF_21HZ, DLPF_10HZ, DLPF_5HZ};
+    const char* dlpf_names[] = {"260Hz (RAW)", "184Hz", "94Hz", "44Hz", "21Hz", "10Hz", "5Hz"};
 
-    // If EITHER imu is missing calibration, run the gyro zero-bias calibration
-    if (!imu1_ready || !imu2_ready) {
-        
-        // Run a deep 2000-sample calibration
-        calibrate_gyro(my_imus, 2, 2000);
-        
-        // Re-setup and reload after calibration to ensure applied offsets
-        for(int i=0; i<2; i++) {
-            setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
-            load_calibration(&my_imus[i]);
+    uint8_t s_rates[] = {SAMPLE_1000HZ, SAMPLE_500HZ, SAMPLE_250HZ, SAMPLE_100HZ};
+    const char* s_names[] = {"1000Hz", "500Hz", "250Hz", "100Hz"};
+
+    printf("--- Starting 448-Stage Exhaustive Hardware Test (~37 Minutes) ---\n");
+    sleep(2);
+
+    int test_number = 1;
+
+    // 4-Level Deep Nested Loop for all combinations
+    for(int a = 0; a < 4; a++) {
+        for(int g = 0; g < 4; g++) {
+            for(int d = 0; d < 7; d++) {
+                for(int s = 0; s < 4; s++) {
+                    
+                    // 1. Apply hardware settings to both IMUs
+                    for(int i = 0; i < 2; i++) {
+                        if (!setup_imu(&my_imus[i], a_ranges[a], g_ranges[g], dlpfs[d], s_rates[s])) {
+                            return 1; // Exit if I2C fails
+                        }
+                        // Attempt to load calibration, but don't force a sweep if missing
+                        if (!load_calibration(&my_imus[i])) {
+                            my_imus[i].gx_offset = 0;
+                            my_imus[i].gy_offset = 0;
+                            my_imus[i].gz_offset = 0;
+                        }
+                    }
+
+                    // 2. Setup timing for a 5-second run
+                    long run_dt_ns = get_frame_dt_ns(s_rates[s]);
+                    int hz = 1000 / (1 + s_rates[s]);
+                    int total_frames = hz * 5; // Exactly 5 seconds of data
+                    int refresh_rate = hz / 10; // Update console 10 times a second
+
+                    struct timespec start, now;
+                    clock_gettime(CLOCK_MONOTONIC, &start);
+
+                    // 3. The 5-Second Precision Run
+                    for(int frame = 0; frame < total_frames; frame++) {
+                        do {
+                            clock_gettime(CLOCK_MONOTONIC, &now);
+                        } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < run_dt_ns);
+
+                        start.tv_nsec += run_dt_ns;
+                        while (start.tv_nsec >= 1000000000L) {
+                            start.tv_nsec -= 1000000000L;
+                            start.tv_sec += 1;
+                        }
+
+                        read_imu_data(&my_imus[0]);
+                        read_imu_data(&my_imus[1]);
+
+                        // 4. Console Output
+                        if (frame % refresh_rate == 0) {
+                            printf("\033[2J\033[H"); // Clear screen
+                            printf("=== EXHAUSTIVE TEST [%d/448] ===\n", test_number);
+                            printf("SETTING: Accel: %s | Gyro: %s | DLPF: %s | Rate: %s\n", 
+                                   a_names[a], g_names[g], dlpf_names[d], s_names[s]);
+                            printf("TIME REMAINING: %d seconds\n\n", 5 - (frame / hz));
+
+                            printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", my_imus[0].temp_c);
+                            printf("ACCEL: X:%7.3f Y:%7.3f Z:%7.3f\n", my_imus[0].ax_g, my_imus[0].ay_g, my_imus[0].az_g);
+                            printf("GYRO:  X:%7.2f Y:%7.2f Z:%7.2f\n", my_imus[0].gx_ds, my_imus[0].gy_ds, my_imus[0].gz_ds);
+                            
+                            printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", my_imus[1].temp_c);
+                            printf("ACCEL: X:%7.3f Y:%7.3f Z:%7.3f\n", my_imus[1].ax_g, my_imus[1].ay_g, my_imus[1].az_g);
+                            printf("GYRO:  X:%7.2f Y:%7.2f Z:%7.2f\n", my_imus[1].gx_ds, my_imus[1].gy_ds, my_imus[1].gz_ds);
+                        }
+                    }
+                    test_number++;
+                }
+            }
         }
     }
-
-    printf("\nRunning Sensors at target rate. Press Ctrl+C to stop.\n");
-    sleep(1); 
     
-    int counter = 0;
-    long run_dt_ns = get_frame_dt_ns(RUN_RATE);
-    struct timespec start, now;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    while(1) {
-        do {
-            clock_gettime(CLOCK_MONOTONIC, &now);
-        } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < run_dt_ns);
-
-        start.tv_nsec += run_dt_ns;
-        while (start.tv_nsec >= 1000000000L) {
-            start.tv_nsec -= 1000000000L;
-            start.tv_sec += 1;
-        }
-
-        read_imu_data(&my_imus[0]);
-        read_imu_data(&my_imus[1]);
-
-        if (counter % 50 == 0) {
-            printf("\033[2J\033[H"); 
-            printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", my_imus[0].temp_c);
-            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", my_imus[0].ax_g, my_imus[0].ay_g, my_imus[0].az_g);
-            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[0].gx_ds, my_imus[0].gy_ds, my_imus[0].gz_ds);
-            
-            printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", my_imus[1].temp_c);
-            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", my_imus[1].ax_g, my_imus[1].ay_g, my_imus[1].az_g);
-            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[1].gx_ds, my_imus[1].gy_ds, my_imus[1].gz_ds);
-        }
-        counter++;
-    }
+    printf("\033[2J\033[H");
+    printf(">>> ALL 448 CONFIGURATIONS TESTED SUCCESSFULLY <<<\n");
     return 0;
 }
