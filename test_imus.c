@@ -140,7 +140,8 @@ void ensure_calib_dir_exists(int addr, uint8_t g_range, uint8_t dlpf, int temp_b
     if (stat(path, &st) == -1) mkdir(path, 0777);
 }
 
-int load_calibration(MPU6050_Device *dev) {
+// Updated to optionally return the loaded path string
+int load_calibration(MPU6050_Device *dev, char *out_path) {
     read_imu_data(dev); // Get current temp
     
     int target_bucket = (int)dev->temp_c; 
@@ -172,8 +173,24 @@ int load_calibration(MPU6050_Device *dev) {
     if (f) {
         fscanf(f, "%f %f %f %f", &dev->gx_offset, &dev->gy_offset, &dev->gz_offset, &dev->calib_temp);
         fclose(f);
+        
+        if (out_path) {
+            // Give the path back to the test loop quietly
+            snprintf(out_path, 128, "%s", filepath);
+        } else {
+            // Standard console print for normal startup
+            if (found_distance == 0) {
+                printf(">> Loaded config for IMU 0x%02x from %s\n", dev->addr, filepath);
+            } else if (found_distance <= 5) {
+                printf(">> Loaded nearby bucket (%dC) for IMU 0x%02x from %s\n", actual_bucket, dev->addr, filepath);
+            }
+        }
         return 1; 
     }
+    
+    if (out_path) snprintf(out_path, 128, "NO_FILE_FOUND");
+    else printf(">> CRITICAL: No calibration found for IMU 0x%02x\n", dev->addr);
+    
     return 0; 
 }
 
@@ -205,6 +222,9 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                 sum_gx[j] = 0; sum_gy[j] = 0; sum_gz[j] = 0; sum_temp[j] = 0;
                 devs[j].gx_offset = 0.0; devs[j].gy_offset = 0.0; devs[j].gz_offset = 0.0;
             }
+
+            // ---> ADDED: Filter Settling Delay to prevent corrupted initial math <---
+            usleep(50000); 
 
             long target_ns = get_frame_dt_ns(SAMPLE_1000HZ);
             struct timespec start, now;
@@ -294,7 +314,7 @@ void gyro_calibration_test(MPU6050_Device *devs, int num_devs) {
     for (int s = 0; s < 4; s++) {
         for (int g = 0; g < 4; g++) {
             for (int d = 0; d < 7; d++) {
-                printf("[ %-7s | %-7s | %-6s ]\n", g_names[g], d_names[d], s_names[s]);
+                printf("=== [ %-7s | %-7s | %-6s ] ===\n", g_names[g], d_names[d], s_names[s]);
 
                 float sum_res_x[num_devs], sum_res_y[num_devs], sum_res_z[num_devs];
 
@@ -303,17 +323,21 @@ void gyro_calibration_test(MPU6050_Device *devs, int num_devs) {
                     
                     setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], s_rates[s]);
                     
-                    if (!load_calibration(&devs[j])) {
-                        // If calibration file doesn't exist, zero it out so test reveals the raw bias
+                    // Fetch the loaded path silently
+                    char loaded_path[128];
+                    if (!load_calibration(&devs[j], loaded_path)) {
                         devs[j].gx_offset = 0.0; devs[j].gy_offset = 0.0; devs[j].gz_offset = 0.0;
                     }
+                    printf("  -> IMU 0x%02x: Loaded [%s]\n", devs[j].addr, loaded_path);
                 }
+
+                // ---> ADDED: Filter Settling Delay to prevent testing transient spikes <---
+                usleep(50000);
 
                 long target_ns = get_frame_dt_ns(s_rates[s]);
                 struct timespec start, now;
                 clock_gettime(CLOCK_MONOTONIC, &start);
 
-                // Collect and accumulate live feed (Offsets are automatically applied inside read_imu_data)
                 for (int i = 0; i < num_samples; i++) {
                     do {
                         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -378,21 +402,21 @@ int main() {
         if (!setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
     }
 
-    // Check if we need to run the master calibration sweep
-    int imu1_ready = load_calibration(&my_imus[0]);
-    int imu2_ready = load_calibration(&my_imus[1]);
+    // Check if we need to run the master calibration sweep (Pass NULL so it prints normally)
+    int imu1_ready = load_calibration(&my_imus[0], NULL);
+    int imu2_ready = load_calibration(&my_imus[1], NULL);
 
     if (!imu1_ready || !imu2_ready) {
         calibrate_gyro_sweep(my_imus, 2, 500);
     }
 
-    // ---> NEW: Run the comprehensive debiasing verification test
+    // Run the comprehensive debiasing verification test
     gyro_calibration_test(my_imus, 2);
     
     // Re-setup target config for the final running loop
     for(int i=0; i<2; i++) {
         setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
-        load_calibration(&my_imus[i]);
+        load_calibration(&my_imus[i], NULL);
     }
 
     printf("Running Sensors at target rate. Press Ctrl+C to stop.\n");
