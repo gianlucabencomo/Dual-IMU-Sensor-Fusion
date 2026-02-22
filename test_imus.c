@@ -11,7 +11,7 @@
 #include <time.h>
 #include "mpu6050.h"
 
-#define ABS(x) ((x) < 0 ? -(x) : (x)) // Quick macro for absolute value
+#define ABS(x) ((x) < 0 ? -(x) : (x)) 
 
 // --- Global Setup ---
 int file;
@@ -90,7 +90,6 @@ int setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlp
 // --- 2. DATA ACQUISITION ---
 void read_imu_data(MPU6050_Device *dev) {
     uint8_t buffer[14]; 
-
     if (ioctl(file, I2C_SLAVE, dev->addr) < 0) return;
 
     if (i2c_smbus_read_i2c_block_data(file, ACCEL_XOUT_H, 14, buffer) == 14) {
@@ -126,41 +125,35 @@ void ensure_calib_dir_exists(int addr, uint8_t g_range, uint8_t dlpf, int temp_b
     char path[128];
     
     if (stat("calib", &st) == -1) mkdir("calib", 0777);
-    
     snprintf(path, sizeof(path), "calib/0x%02x", addr);
     if (stat(path, &st) == -1) mkdir(path, 0777);
-    
     snprintf(path, sizeof(path), "calib/0x%02x/G%02x", addr, g_range);
     if (stat(path, &st) == -1) mkdir(path, 0777);
-
     snprintf(path, sizeof(path), "calib/0x%02x/G%02x/D%02x", addr, g_range, dlpf);
     if (stat(path, &st) == -1) mkdir(path, 0777);
-
     snprintf(path, sizeof(path), "calib/0x%02x/G%02x/D%02x/%d", addr, g_range, dlpf, temp_bucket);
     if (stat(path, &st) == -1) mkdir(path, 0777);
 }
 
-// Updated to optionally return the loaded path string
 int load_calibration(MPU6050_Device *dev, char *out_path) {
-    read_imu_data(dev); // Get current temp
+    read_imu_data(dev); 
     
     int target_bucket = (int)dev->temp_c; 
     char filepath[128];
     FILE *f = NULL;
     
     int actual_bucket = target_bucket;
-    int max_search_radius = 5;
+    // Aggressive search radius to find whatever is available
+    int max_search_radius = 20; 
     int found_distance = -1;
 
     for (int offset = 0; offset <= max_search_radius; offset++) {
-        // Try negative
         actual_bucket = target_bucket - offset;
         snprintf(filepath, sizeof(filepath), "calib/0x%02x/G%02x/D%02x/%d/offsets.txt", 
                  dev->addr, dev->g_range, dev->dlpf, actual_bucket);
         f = fopen(filepath, "r");
         if (f) { found_distance = offset; break; }
         
-        // Try positive
         if (offset > 0) { 
             actual_bucket = target_bucket + offset;
             snprintf(filepath, sizeof(filepath), "calib/0x%02x/G%02x/D%02x/%d/offsets.txt", 
@@ -173,24 +166,11 @@ int load_calibration(MPU6050_Device *dev, char *out_path) {
     if (f) {
         fscanf(f, "%f %f %f %f", &dev->gx_offset, &dev->gy_offset, &dev->gz_offset, &dev->calib_temp);
         fclose(f);
-        
-        if (out_path) {
-            // Give the path back to the test loop quietly
-            snprintf(out_path, 128, "%s", filepath);
-        } else {
-            // Standard console print for normal startup
-            if (found_distance == 0) {
-                printf(">> Loaded config for IMU 0x%02x from %s\n", dev->addr, filepath);
-            } else if (found_distance <= 5) {
-                printf(">> Loaded nearby bucket (%dC) for IMU 0x%02x from %s\n", actual_bucket, dev->addr, filepath);
-            }
-        }
+        if (out_path) snprintf(out_path, 128, "%s", filepath);
         return 1; 
     }
     
-    if (out_path) snprintf(out_path, 128, "NO_FILE_FOUND");
-    else printf(">> CRITICAL: No calibration found for IMU 0x%02x\n", dev->addr);
-    
+    if (out_path) snprintf(out_path, 128, "NO_FILE_FOUND_NEAR_%dC", target_bucket);
     return 0; 
 }
 
@@ -201,7 +181,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
 
     uint8_t g_ranges[] = {GYRO_FS_250, GYRO_FS_500, GYRO_FS_1000, GYRO_FS_2000};
     uint8_t dlpfs[] = {DLPF_260HZ, DLPF_184HZ, DLPF_94HZ, DLPF_44HZ, DLPF_21HZ, DLPF_10HZ, DLPF_5HZ};
-
     float *gx_log[num_devs], *gy_log[num_devs], *gz_log[num_devs], *temp_log[num_devs];
     
     for (int g = 0; g < 4; g++) {
@@ -213,18 +192,15 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
 
             for(int j = 0; j < num_devs; j++) {
                 setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], SAMPLE_1000HZ);
-                
                 gx_log[j] = (float *)malloc(num_samples * sizeof(float));
                 gy_log[j] = (float *)malloc(num_samples * sizeof(float));
                 gz_log[j] = (float *)malloc(num_samples * sizeof(float));
                 temp_log[j] = (float *)malloc(num_samples * sizeof(float));
-                
-                sum_gx[j] = 0; sum_gy[j] = 0; sum_gz[j] = 0; sum_temp[j] = 0;
+                sum_gx[j] = sum_gy[j] = sum_gz[j] = sum_temp[j] = 0;
                 devs[j].gx_offset = 0.0; devs[j].gy_offset = 0.0; devs[j].gz_offset = 0.0;
             }
 
-            // ---> ADDED: Filter Settling Delay to prevent corrupted initial math <---
-            usleep(50000); 
+            usleep(50000); // Settle filter before recording
 
             long target_ns = get_frame_dt_ns(SAMPLE_1000HZ);
             struct timespec start, now;
@@ -234,25 +210,15 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                 do {
                     clock_gettime(CLOCK_MONOTONIC, &now);
                 } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < target_ns);
-
                 start.tv_nsec += target_ns;
-                while (start.tv_nsec >= 1000000000L) {
-                    start.tv_nsec -= 1000000000L;
-                    start.tv_sec += 1;
-                }
+                if (start.tv_nsec >= 1000000000L) { start.tv_nsec -= 1000000000L; start.tv_sec += 1; }
 
                 for(int j = 0; j < num_devs; j++) {
                     read_imu_data(&devs[j]);
-                    
-                    gx_log[j][i] = devs[j].gx_ds;
-                    gy_log[j][i] = devs[j].gy_ds;
-                    gz_log[j][i] = devs[j].gz_ds;
-                    temp_log[j][i] = devs[j].temp_c;
-
-                    sum_gx[j] += devs[j].gx_ds;
-                    sum_gy[j] += devs[j].gy_ds;
-                    sum_gz[j] += devs[j].gz_ds;
-                    sum_temp[j] += devs[j].temp_c;
+                    gx_log[j][i] = devs[j].gx_ds; gy_log[j][i] = devs[j].gy_ds;
+                    gz_log[j][i] = devs[j].gz_ds; temp_log[j][i] = devs[j].temp_c;
+                    sum_gx[j] += devs[j].gx_ds; sum_gy[j] += devs[j].gy_ds;
+                    sum_gz[j] += devs[j].gz_ds; sum_temp[j] += devs[j].temp_c;
                 }
             }
 
@@ -261,195 +227,119 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                 devs[j].gy_offset = sum_gy[j] / num_samples;
                 devs[j].gz_offset = sum_gz[j] / num_samples;
                 devs[j].calib_temp = sum_temp[j] / num_samples;
-
                 int temp_bucket = (int)devs[j].calib_temp;
                 ensure_calib_dir_exists(devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
 
                 char csv_path[128];
-                snprintf(csv_path, sizeof(csv_path), "calib/0x%02x/G%02x/D%02x/%d/gyro.csv", 
-                         devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
+                snprintf(csv_path, sizeof(csv_path), "calib/0x%02x/G%02x/D%02x/%d/gyro.csv", devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
                 FILE *f_csv = fopen(csv_path, "w");
                 if (f_csv) {
                     fprintf(f_csv, "Sample,Raw_Gx,Raw_Gy,Raw_Gz,Temp_C\n");
-                    for (int i = 0; i < num_samples; i++) {
-                        fprintf(f_csv, "%d,%f,%f,%f,%f\n", i, gx_log[j][i], gy_log[j][i], gz_log[j][i], temp_log[j][i]);
-                    }
+                    for (int i = 0; i < num_samples; i++) fprintf(f_csv, "%d,%f,%f,%f,%f\n", i, gx_log[j][i], gy_log[j][i], gz_log[j][i], temp_log[j][i]);
                     fclose(f_csv);
                 }
-
                 char offset_path[128];
-                snprintf(offset_path, sizeof(offset_path), "calib/0x%02x/G%02x/D%02x/%d/offsets.txt", 
-                         devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
+                snprintf(offset_path, sizeof(offset_path), "calib/0x%02x/G%02x/D%02x/%d/offsets.txt", devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
                 FILE *f_off = fopen(offset_path, "w");
-                if (f_off) {
-                    fprintf(f_off, "%f %f %f %f\n", devs[j].gx_offset, devs[j].gy_offset, devs[j].gz_offset, devs[j].calib_temp);
-                    fclose(f_off);
-                }
-
+                if (f_off) { fprintf(f_off, "%f %f %f %f\n", devs[j].gx_offset, devs[j].gy_offset, devs[j].gz_offset, devs[j].calib_temp); fclose(f_off); }
                 free(gx_log[j]); free(gy_log[j]); free(gz_log[j]); free(temp_log[j]);
             }
             printf("Done.\n");
         }
     }
-    printf(">>> FULL GYRO SWEEP COMPLETE <<<\n\n");
 }
 
-// --- NEW: VERIFICATION TEST ---
+// --- VERIFICATION TEST ---
 void gyro_calibration_test(MPU6050_Device *devs, int num_devs) {
     printf("\n>>> STARTING VERIFICATION TEST (112 Configurations) <<<\n");
-    printf("Testing all Rates, Ranges, and DLPFs. Target: Absolute Average < 0.1 dps\n\n");
     sleep(2);
 
     uint8_t g_ranges[] = {GYRO_FS_250, GYRO_FS_500, GYRO_FS_1000, GYRO_FS_2000};
-    const char* g_names[] = {"250dps", "500dps", "1000dps", "2000dps"};
-
     uint8_t dlpfs[] = {DLPF_260HZ, DLPF_184HZ, DLPF_94HZ, DLPF_44HZ, DLPF_21HZ, DLPF_10HZ, DLPF_5HZ};
-    const char* d_names[] = {"260Hz", "184Hz", "94Hz", "44Hz", "21Hz", "10Hz", "5Hz"};
-
     uint8_t s_rates[] = {SAMPLE_1000HZ, SAMPLE_500HZ, SAMPLE_250HZ, SAMPLE_100HZ};
+    const char* g_names[] = {"250dps", "500dps", "1000dps", "2000dps"};
+    const char* d_names[] = {"260Hz", "184Hz", "94Hz", "44Hz", "21Hz", "10Hz", "5Hz"};
     const char* s_names[] = {"1000Hz", "500Hz", "250Hz", "100Hz"};
-
-    int num_samples = 500;
 
     for (int s = 0; s < 4; s++) {
         for (int g = 0; g < 4; g++) {
             for (int d = 0; d < 7; d++) {
                 printf("=== [ %-7s | %-7s | %-6s ] ===\n", g_names[g], d_names[d], s_names[s]);
-
                 float sum_res_x[num_devs], sum_res_y[num_devs], sum_res_z[num_devs];
 
+                // 1. Setup All Hardware first
+                for(int j = 0; j < num_devs; j++) setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], s_rates[s]);
+
+                // 2. WAIT for hardware/filters to stabilize BEFORE loading calibration (temp read)
+                usleep(50000); 
+
+                // 3. Load offsets now that temp reading is stable
                 for(int j = 0; j < num_devs; j++) {
-                    sum_res_x[j] = 0; sum_res_y[j] = 0; sum_res_z[j] = 0;
-                    
-                    setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], s_rates[s]);
-                    
-                    // Fetch the loaded path silently
-                    char loaded_path[128];
-                    if (!load_calibration(&devs[j], loaded_path)) {
-                        devs[j].gx_offset = 0.0; devs[j].gy_offset = 0.0; devs[j].gz_offset = 0.0;
-                    }
-                    printf("  -> IMU 0x%02x: Loaded [%s]\n", devs[j].addr, loaded_path);
+                    sum_res_x[j] = sum_res_y[j] = sum_res_z[j] = 0;
+                    char path[128];
+                    if (!load_calibration(&devs[j], path)) { devs[j].gx_offset = devs[j].gy_offset = devs[j].gz_offset = 0; }
+                    printf("  -> IMU 0x%02x: Loaded [%s]\n", devs[j].addr, path);
                 }
 
-                // ---> ADDED: Filter Settling Delay to prevent testing transient spikes <---
-                usleep(50000);
-
+                // 4. Test Loop
                 long target_ns = get_frame_dt_ns(s_rates[s]);
                 struct timespec start, now;
                 clock_gettime(CLOCK_MONOTONIC, &start);
 
-                for (int i = 0; i < num_samples; i++) {
-                    do {
-                        clock_gettime(CLOCK_MONOTONIC, &now);
-                    } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < target_ns);
-
+                for (int i = 0; i < 500; i++) {
+                    do { clock_gettime(CLOCK_MONOTONIC, &now); } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < target_ns);
                     start.tv_nsec += target_ns;
-                    while (start.tv_nsec >= 1000000000L) {
-                        start.tv_nsec -= 1000000000L;
-                        start.tv_sec += 1;
-                    }
+                    if (start.tv_nsec >= 1000000000L) { start.tv_nsec -= 1000000000L; start.tv_sec += 1; }
 
                     for(int j = 0; j < num_devs; j++) {
                         read_imu_data(&devs[j]);
-                        sum_res_x[j] += devs[j].gx_ds;
-                        sum_res_y[j] += devs[j].gy_ds;
-                        sum_res_z[j] += devs[j].gz_ds;
+                        sum_res_x[j] += devs[j].gx_ds; sum_res_y[j] += devs[j].gy_ds; sum_res_z[j] += devs[j].gz_ds;
                     }
                 }
 
-                // Evaluate and Print
                 for(int j = 0; j < num_devs; j++) {
-                    float avg_x = sum_res_x[j] / num_samples;
-                    float avg_y = sum_res_y[j] / num_samples;
-                    float avg_z = sum_res_z[j] / num_samples;
-
-                    int passed = (ABS(avg_x) < 0.1 && ABS(avg_y) < 0.1 && ABS(avg_z) < 0.1);
-
-                    if (passed) {
-                        printf("  -> IMU 0x%02x: \033[0;32mTRUE \033[0m (Res: X:%6.2f, Y:%6.2f, Z:%6.2f)\n", 
-                               devs[j].addr, avg_x, avg_y, avg_z);
-                    } else {
-                        printf("  -> IMU 0x%02x: \033[0;31mFALSE\033[0m (Res: X:%6.2f, Y:%6.2f, Z:%6.2f)\n", 
-                               devs[j].addr, avg_x, avg_y, avg_z);
-                    }
+                    float ax = sum_res_x[j]/500, ay = sum_res_y[j]/500, az = sum_res_z[j]/500;
+                    if (ABS(ax) < 0.1 && ABS(ay) < 0.1 && ABS(az) < 0.1) printf("  -> IMU 0x%02x: \033[0;32mTRUE \033[0m (Res: X:%6.2f, Y:%6.2f, Z:%6.2f)\n", devs[j].addr, ax, ay, az);
+                    else printf("  -> IMU 0x%02x: \033[0;31mFALSE\033[0m (Res: X:%6.2f, Y:%6.2f, Z:%6.2f)\n", devs[j].addr, ax, ay, az);
                 }
                 printf("\n");
             }
         }
     }
-    printf(">>> VERIFICATION TEST COMPLETE <<<\n\n");
 }
 
 // --- 5. MAIN ---
 int main() {
     file = open(bus, O_RDWR);
-    if (file < 0) {
-        perror("Failed to open I2C bus");
-        return 1;
-    }
+    if (file < 0) { perror("Failed to open I2C bus"); return 1; }
 
     MPU6050_Device imu1 = { .addr = IMU1_ADDR };
     MPU6050_Device imu2 = { .addr = IMU2_ADDR };
     MPU6050_Device my_imus[2] = { imu1, imu2 };
 
-    uint8_t RUN_ACCEL = ACCEL_FS_2G;
-    uint8_t RUN_GYRO  = GYRO_FS_500;
-    uint8_t RUN_DLPF  = DLPF_94HZ;
-    uint8_t RUN_RATE  = SAMPLE_500HZ;
-
     printf("--- Initializing Hardware ---\n");
-    for(int i=0; i<2; i++) {
-        if (!setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
-    }
+    for(int i=0; i<2; i++) setup_imu(&my_imus[i], ACCEL_FS_2G, GYRO_FS_500, DLPF_94HZ, SAMPLE_500HZ);
 
-    // Check if we need to run the master calibration sweep (Pass NULL so it prints normally)
-    int imu1_ready = load_calibration(&my_imus[0], NULL);
-    int imu2_ready = load_calibration(&my_imus[1], NULL);
-
-    if (!imu1_ready || !imu2_ready) {
+    if (!load_calibration(&my_imus[0], NULL) || !load_calibration(&my_imus[1], NULL)) {
         calibrate_gyro_sweep(my_imus, 2, 500);
     }
 
-    // Run the comprehensive debiasing verification test
     gyro_calibration_test(my_imus, 2);
     
-    // Re-setup target config for the final running loop
-    for(int i=0; i<2; i++) {
-        setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
-        load_calibration(&my_imus[i], NULL);
-    }
+    for(int i=0; i<2; i++) { setup_imu(&my_imus[i], ACCEL_FS_2G, GYRO_FS_500, DLPF_94HZ, SAMPLE_500HZ); load_calibration(&my_imus[i], NULL); }
 
-    printf("Running Sensors at target rate. Press Ctrl+C to stop.\n");
-    sleep(1); 
-    
     int counter = 0;
-    long run_dt_ns = get_frame_dt_ns(RUN_RATE);
+    long dt = get_frame_dt_ns(SAMPLE_500HZ);
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
     while(1) {
-        do {
-            clock_gettime(CLOCK_MONOTONIC, &now);
-        } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < run_dt_ns);
-
-        start.tv_nsec += run_dt_ns;
-        while (start.tv_nsec >= 1000000000L) {
-            start.tv_nsec -= 1000000000L;
-            start.tv_sec += 1;
-        }
-
-        read_imu_data(&my_imus[0]);
-        read_imu_data(&my_imus[1]);
-
+        do { clock_gettime(CLOCK_MONOTONIC, &now); } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < dt);
+        start.tv_nsec += dt;
+        if (start.tv_nsec >= 1000000000L) { start.tv_nsec -= 1000000000L; start.tv_sec += 1; }
+        read_imu_data(&my_imus[0]); read_imu_data(&my_imus[1]);
         if (counter % 50 == 0) {
-            printf("\033[2J\033[H"); 
-            printf("=== IMU 1 (0x68) === [Temp: %.1f C]\n", my_imus[0].temp_c);
-            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", my_imus[0].ax_g, my_imus[0].ay_g, my_imus[0].az_g);
-            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[0].gx_ds, my_imus[0].gy_ds, my_imus[0].gz_ds);
-            
-            printf("\n=== IMU 2 (0x69) === [Temp: %.1f C]\n", my_imus[1].temp_c);
-            printf("ACCEL: X:%6.2f Y:%6.2f Z:%6.2f\n", my_imus[1].ax_g, my_imus[1].ay_g, my_imus[1].az_g);
-            printf("GYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[1].gx_ds, my_imus[1].gy_ds, my_imus[1].gz_ds);
+            printf("\033[2J\033[H=== IMU 1 (0x68) === [Temp: %.1f C]\nACCEL: X:%6.2f Y:%6.2f Z:%6.2f\nGYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n\n=== IMU 2 (0x69) === [Temp: %.1f C]\nACCEL: X:%6.2f Y:%6.2f Z:%6.2f\nGYRO:  X:%6.1f Y:%6.1f Z:%6.1f\n", my_imus[0].temp_c, my_imus[0].ax_g, my_imus[0].ay_g, my_imus[0].az_g, my_imus[0].gx_ds, my_imus[0].gy_ds, my_imus[0].gz_ds, my_imus[1].temp_c, my_imus[1].ax_g, my_imus[1].ay_g, my_imus[1].az_g, my_imus[1].gx_ds, my_imus[1].gy_ds, my_imus[1].gz_ds);
         }
         counter++;
     }
