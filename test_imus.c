@@ -10,12 +10,20 @@
 #include <time.h>
 #include "mpu6050.h"
 
+/*
+In linux, everything is a file.
+
+We read and write to dev/i2c-1 because that's how we wired up.
+*/
 int file;
 const char *bus = "/dev/i2c-1";
 
+/*
+This is our data container.
+*/
 typedef struct {
     int addr; 
-    float a_scale; 
+    float a_scale;
     float g_scale; 
 
     // Configuration State
@@ -34,41 +42,42 @@ typedef struct {
     float temp_c;
 } MPU6050_Device;
 
-// --- 1. HARDWARE SETUP ---
 int setup_imu(MPU6050_Device *dev, uint8_t a_range, uint8_t g_range, uint8_t dlpf, uint8_t sample_rate) {
     if (ioctl(file, I2C_SLAVE, dev->addr) < 0) {
         printf("System Error: Failed to connect to I2C bus for IMU at 0x%02x\n", dev->addr);
         return 0;
     }
 
-    int who_am_i = i2c_smbus_read_byte_data(file, WHO_AM_I);
+    int who_am_i = i2c_smbus_read_byte_data(file, WHO_AM_I); // The WHO_AM_I register is a hard-coded "Part Number," not the I2C address.
     if (who_am_i != 0x68) {
         printf("Hardware Error: IMU at 0x%02x returned WHO_AM_I = 0x%02x (Expected 0x68). Check wiring!\n", dev->addr, who_am_i);
         return 0; 
     }
     
     i2c_smbus_write_byte_data(file, PWR_MGMT_1, 0x00); // Wake Up
+
+    // set range and scale for accelerometer
     i2c_smbus_write_byte_data(file, ACCEL_CONFIG, a_range);
-    
     switch(a_range) {
         case ACCEL_FS_2G:  dev->a_scale = 16384.0; break;
         case ACCEL_FS_4G:  dev->a_scale = 8192.0;  break;
         case ACCEL_FS_8G:  dev->a_scale = 4096.0;  break;
         case ACCEL_FS_16G: dev->a_scale = 2048.0;  break;
-        default: dev->a_scale = 16384.0;
+        default: dev->a_scale = 16384.0; // default to 2G
     }
 
+    // set range and scale for gyroscope
     i2c_smbus_write_byte_data(file, GYRO_CONFIG, g_range);
     switch(g_range) {
         case GYRO_FS_250:  dev->g_scale = 131.0; break;
         case GYRO_FS_500:  dev->g_scale = 65.5;  break;
         case GYRO_FS_1000: dev->g_scale = 32.8;  break;
         case GYRO_FS_2000: dev->g_scale = 16.4;  break;
-        default: dev->g_scale = 131.0;
+        default: dev->g_scale = 131.0; // default to 250 dps
     }
 
-    i2c_smbus_write_byte_data(file, CONFIG, dlpf);
-    i2c_smbus_write_byte_data(file, SMPLRT_DIV, sample_rate); 
+    i2c_smbus_write_byte_data(file, CONFIG, dlpf); // set what low-pass filter we are running
+    i2c_smbus_write_byte_data(file, SMPLRT_DIV, sample_rate); // set the sample rate (how fast we fill buffer)
 
     // Store state
     dev->a_range = a_range;
@@ -143,7 +152,7 @@ int load_calibration(MPU6050_Device *dev) {
     FILE *f = NULL;
     
     int actual_bucket = target_bucket;
-    int max_search_radius = 15; 
+    int max_search_radius = 5;
     int found_distance = -1;
 
     // Expanding search pattern: 0, -1, +1, -2, +2...
@@ -216,6 +225,15 @@ void sweep_dual_calibrations(MPU6050_Device *devs, int num_devs) {
         int num_samples = 500;
         float sum_x[num_devs], sum_y[num_devs], sum_z[num_devs], sum_temp[num_devs];
         
+        // ---> NEW: Memory buffers to store raw data during the fast loop
+        float hist_ax[num_devs][num_samples];
+        float hist_ay[num_devs][num_samples];
+        float hist_az[num_devs][num_samples];
+        float hist_gx[num_devs][num_samples];
+        float hist_gy[num_devs][num_samples];
+        float hist_gz[num_devs][num_samples];
+        float hist_temp[num_devs][num_samples];
+        
         // Initialize sums
         for(int j=0; j<num_devs; j++) {
             sum_x[j] = sum_y[j] = sum_z[j] = sum_temp[j] = 0;
@@ -248,6 +266,15 @@ void sweep_dual_calibrations(MPU6050_Device *devs, int num_devs) {
                 sum_y[j] += devs[j].gy_ds;
                 sum_z[j] += devs[j].gz_ds;
                 sum_temp[j] += devs[j].temp_c;
+
+                // ---> NEW: Save the exact readings to our memory buffer
+                hist_ax[j][i] = devs[j].ax_g;
+                hist_ay[j][i] = devs[j].ay_g;
+                hist_az[j][i] = devs[j].az_g;
+                hist_gx[j][i] = devs[j].gx_ds;
+                hist_gy[j][i] = devs[j].gy_ds;
+                hist_gz[j][i] = devs[j].gz_ds;
+                hist_temp[j][i] = devs[j].temp_c;
             }
         }
 
@@ -261,14 +288,34 @@ void sweep_dual_calibrations(MPU6050_Device *devs, int num_devs) {
             int temp_bucket = (int)devs[j].calib_temp; 
             ensure_calib_dir_exists(devs[j].addr, dlpfs[d], temp_bucket);
 
+            // Save the Offsets
             char filepath[128];
             snprintf(filepath, sizeof(filepath), "calib/0x%02x/D%02x/%d/offsets.txt", 
                      devs[j].addr, dlpfs[d], temp_bucket);
-                     
             FILE *f = fopen(filepath, "w");
             if (f) {
                 fprintf(f, "%f %f %f %f\n", devs[j].gx_offset, devs[j].gy_offset, devs[j].gz_offset, devs[j].calib_temp);
                 fclose(f);
+            }
+
+            // ---> NEW: Save all 500 samples to a CSV file
+            char csv_filepath[128];
+            snprintf(csv_filepath, sizeof(csv_filepath), "calib/0x%02x/D%02x/%d/samples.csv", 
+                     devs[j].addr, dlpfs[d], temp_bucket);
+            FILE *f_csv = fopen(csv_filepath, "w");
+            if (f_csv) {
+                // Write header row
+                fprintf(f_csv, "Sample_Index,Ax_g,Ay_g,Az_g,Gx_dps,Gy_dps,Gz_dps,Temp_C\n");
+                
+                // Dump memory buffer to file
+                for (int s = 0; s < num_samples; s++) {
+                    fprintf(f_csv, "%d,%f,%f,%f,%f,%f,%f,%f\n",
+                            s, 
+                            hist_ax[j][s], hist_ay[j][s], hist_az[j][s],
+                            hist_gx[j][s], hist_gy[j][s], hist_gz[j][s],
+                            hist_temp[j][s]);
+                }
+                fclose(f_csv);
             }
         }
         printf("Done.\n");
