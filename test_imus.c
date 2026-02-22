@@ -185,7 +185,7 @@ int load_calibration(MPU6050_Device *dev) {
 
 void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
     printf("\n>>> STARTING FULL GYRO CALIBRATION SWEEP (28 Configurations) <<<\n");
-    printf("DO NOT MOVE SENSORS. Collecting %d samples per setting...\n\n", num_samples);
+    printf("DO NOT MOVE SENSORS. Collecting %d samples per setting at 1000Hz...\n\n", num_samples);
     sleep(3);
 
     uint8_t g_ranges[] = {GYRO_FS_250, GYRO_FS_500, GYRO_FS_1000, GYRO_FS_2000};
@@ -201,9 +201,9 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
 
             float sum_gx[num_devs], sum_gy[num_devs], sum_gz[num_devs], sum_temp[num_devs];
 
-            // Setup hardware for this iteration
+            // Setup hardware for this iteration (locked to 1000Hz)
             for(int j = 0; j < num_devs; j++) {
-                setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], SAMPLE_500HZ);
+                setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], SAMPLE_1000HZ);
                 
                 gx_log[j] = (float *)malloc(num_samples * sizeof(float));
                 gy_log[j] = (float *)malloc(num_samples * sizeof(float));
@@ -214,7 +214,7 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                 devs[j].gx_offset = 0.0; devs[j].gy_offset = 0.0; devs[j].gz_offset = 0.0;
             }
 
-            long target_ns = get_frame_dt_ns(SAMPLE_500HZ);
+            long target_ns = get_frame_dt_ns(SAMPLE_1000HZ);
             struct timespec start, now;
             clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -298,8 +298,8 @@ int main() {
     MPU6050_Device imu2 = { .addr = IMU2_ADDR };
     MPU6050_Device my_imus[2] = { imu1, imu2 };
 
-    uint8_t RUN_ACCEL = ACCEL_FS_8G;
-    uint8_t RUN_GYRO  = GYRO_FS_1000;
+    uint8_t RUN_ACCEL = ACCEL_FS_2G;
+    uint8_t RUN_GYRO  = GYRO_FS_500;
     uint8_t RUN_DLPF  = DLPF_94HZ;
     uint8_t RUN_RATE  = SAMPLE_500HZ;
 
@@ -313,8 +313,9 @@ int main() {
     int imu2_ready = load_calibration(&my_imus[1]);
 
     if (!imu1_ready || !imu2_ready) {
-        // Run the master sweep (28 combinations, 200 samples each)
-        calibrate_gyro_sweep(my_imus, 2, 200);
+        // ---> CHANGED: 500 samples per iteration.
+        // At 1000Hz, this is exactly 0.5 seconds of data per setting.
+        calibrate_gyro_sweep(my_imus, 2, 500);
         
         // Re-setup target config and load offsets
         for(int i=0; i<2; i++) {
