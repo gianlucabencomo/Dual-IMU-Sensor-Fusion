@@ -11,6 +11,8 @@
 #include <time.h>
 #include "mpu6050.h"
 
+#define ABS(x) ((x) < 0 ? -(x) : (x)) // Quick macro for absolute value
+
 // --- Global Setup ---
 int file;
 const char *bus = "/dev/i2c-1";
@@ -170,16 +172,8 @@ int load_calibration(MPU6050_Device *dev) {
     if (f) {
         fscanf(f, "%f %f %f %f", &dev->gx_offset, &dev->gy_offset, &dev->gz_offset, &dev->calib_temp);
         fclose(f);
-        
-        if (found_distance == 0) {
-            printf(">> Loaded config for IMU 0x%02x from %s\n", dev->addr, filepath);
-        } else if (found_distance <= 5) {
-            printf(">> Loaded nearby bucket (%dC) for IMU 0x%02x\n", actual_bucket, dev->addr);
-        }
         return 1; 
     }
-    
-    printf(">> CRITICAL: No calibration found for IMU 0x%02x\n", dev->addr);
     return 0; 
 }
 
@@ -191,7 +185,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
     uint8_t g_ranges[] = {GYRO_FS_250, GYRO_FS_500, GYRO_FS_1000, GYRO_FS_2000};
     uint8_t dlpfs[] = {DLPF_260HZ, DLPF_184HZ, DLPF_94HZ, DLPF_44HZ, DLPF_21HZ, DLPF_10HZ, DLPF_5HZ};
 
-    // Arrays to hold memory buffers for parallel processing
     float *gx_log[num_devs], *gy_log[num_devs], *gz_log[num_devs], *temp_log[num_devs];
     
     for (int g = 0; g < 4; g++) {
@@ -201,7 +194,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
 
             float sum_gx[num_devs], sum_gy[num_devs], sum_gz[num_devs], sum_temp[num_devs];
 
-            // Setup hardware for this iteration (locked to 1000Hz)
             for(int j = 0; j < num_devs; j++) {
                 setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], SAMPLE_1000HZ);
                 
@@ -218,7 +210,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
             struct timespec start, now;
             clock_gettime(CLOCK_MONOTONIC, &start);
 
-            // Precision Collection Loop
             for (int i = 0; i < num_samples; i++) {
                 do {
                     clock_gettime(CLOCK_MONOTONIC, &now);
@@ -245,7 +236,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                 }
             }
 
-            // Save Data
             for(int j = 0; j < num_devs; j++) {
                 devs[j].gx_offset = sum_gx[j] / num_samples;
                 devs[j].gy_offset = sum_gy[j] / num_samples;
@@ -255,7 +245,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                 int temp_bucket = (int)devs[j].calib_temp;
                 ensure_calib_dir_exists(devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
 
-                // Save raw samples
                 char csv_path[128];
                 snprintf(csv_path, sizeof(csv_path), "calib/0x%02x/G%02x/D%02x/%d/gyro.csv", 
                          devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
@@ -268,7 +257,6 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
                     fclose(f_csv);
                 }
 
-                // Save calculated offsets
                 char offset_path[128];
                 snprintf(offset_path, sizeof(offset_path), "calib/0x%02x/G%02x/D%02x/%d/offsets.txt", 
                          devs[j].addr, g_ranges[g], dlpfs[d], temp_bucket);
@@ -284,6 +272,88 @@ void calibrate_gyro_sweep(MPU6050_Device *devs, int num_devs, int num_samples) {
         }
     }
     printf(">>> FULL GYRO SWEEP COMPLETE <<<\n\n");
+}
+
+// --- NEW: VERIFICATION TEST ---
+void gyro_calibration_test(MPU6050_Device *devs, int num_devs) {
+    printf("\n>>> STARTING VERIFICATION TEST (112 Configurations) <<<\n");
+    printf("Testing all Rates, Ranges, and DLPFs. Target: Absolute Average < 0.1 dps\n\n");
+    sleep(2);
+
+    uint8_t g_ranges[] = {GYRO_FS_250, GYRO_FS_500, GYRO_FS_1000, GYRO_FS_2000};
+    const char* g_names[] = {"250dps", "500dps", "1000dps", "2000dps"};
+
+    uint8_t dlpfs[] = {DLPF_260HZ, DLPF_184HZ, DLPF_94HZ, DLPF_44HZ, DLPF_21HZ, DLPF_10HZ, DLPF_5HZ};
+    const char* d_names[] = {"260Hz", "184Hz", "94Hz", "44Hz", "21Hz", "10Hz", "5Hz"};
+
+    uint8_t s_rates[] = {SAMPLE_1000HZ, SAMPLE_500HZ, SAMPLE_250HZ, SAMPLE_100HZ};
+    const char* s_names[] = {"1000Hz", "500Hz", "250Hz", "100Hz"};
+
+    int num_samples = 500;
+
+    for (int s = 0; s < 4; s++) {
+        for (int g = 0; g < 4; g++) {
+            for (int d = 0; d < 7; d++) {
+                printf("[ %-7s | %-7s | %-6s ]\n", g_names[g], d_names[d], s_names[s]);
+
+                float sum_res_x[num_devs], sum_res_y[num_devs], sum_res_z[num_devs];
+
+                for(int j = 0; j < num_devs; j++) {
+                    sum_res_x[j] = 0; sum_res_y[j] = 0; sum_res_z[j] = 0;
+                    
+                    setup_imu(&devs[j], ACCEL_FS_8G, g_ranges[g], dlpfs[d], s_rates[s]);
+                    
+                    if (!load_calibration(&devs[j])) {
+                        // If calibration file doesn't exist, zero it out so test reveals the raw bias
+                        devs[j].gx_offset = 0.0; devs[j].gy_offset = 0.0; devs[j].gz_offset = 0.0;
+                    }
+                }
+
+                long target_ns = get_frame_dt_ns(s_rates[s]);
+                struct timespec start, now;
+                clock_gettime(CLOCK_MONOTONIC, &start);
+
+                // Collect and accumulate live feed (Offsets are automatically applied inside read_imu_data)
+                for (int i = 0; i < num_samples; i++) {
+                    do {
+                        clock_gettime(CLOCK_MONOTONIC, &now);
+                    } while (((now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec)) < target_ns);
+
+                    start.tv_nsec += target_ns;
+                    while (start.tv_nsec >= 1000000000L) {
+                        start.tv_nsec -= 1000000000L;
+                        start.tv_sec += 1;
+                    }
+
+                    for(int j = 0; j < num_devs; j++) {
+                        read_imu_data(&devs[j]);
+                        sum_res_x[j] += devs[j].gx_ds;
+                        sum_res_y[j] += devs[j].gy_ds;
+                        sum_res_z[j] += devs[j].gz_ds;
+                    }
+                }
+
+                // Evaluate and Print
+                for(int j = 0; j < num_devs; j++) {
+                    float avg_x = sum_res_x[j] / num_samples;
+                    float avg_y = sum_res_y[j] / num_samples;
+                    float avg_z = sum_res_z[j] / num_samples;
+
+                    int passed = (ABS(avg_x) < 0.1 && ABS(avg_y) < 0.1 && ABS(avg_z) < 0.1);
+
+                    if (passed) {
+                        printf("  -> IMU 0x%02x: \033[0;32mTRUE \033[0m (Res: X:%6.2f, Y:%6.2f, Z:%6.2f)\n", 
+                               devs[j].addr, avg_x, avg_y, avg_z);
+                    } else {
+                        printf("  -> IMU 0x%02x: \033[0;31mFALSE\033[0m (Res: X:%6.2f, Y:%6.2f, Z:%6.2f)\n", 
+                               devs[j].addr, avg_x, avg_y, avg_z);
+                    }
+                }
+                printf("\n");
+            }
+        }
+    }
+    printf(">>> VERIFICATION TEST COMPLETE <<<\n\n");
 }
 
 // --- 5. MAIN ---
@@ -308,23 +378,24 @@ int main() {
         if (!setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE)) return 1;
     }
 
-    printf("\n--- Gyroscope Calibration Check ---\n");
+    // Check if we need to run the master calibration sweep
     int imu1_ready = load_calibration(&my_imus[0]);
     int imu2_ready = load_calibration(&my_imus[1]);
 
     if (!imu1_ready || !imu2_ready) {
-        // ---> CHANGED: 500 samples per iteration.
-        // At 1000Hz, this is exactly 0.5 seconds of data per setting.
         calibrate_gyro_sweep(my_imus, 2, 500);
-        
-        // Re-setup target config and load offsets
-        for(int i=0; i<2; i++) {
-            setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
-            load_calibration(&my_imus[i]);
-        }
     }
 
-    printf("\nRunning Sensors at target rate. Press Ctrl+C to stop.\n");
+    // ---> NEW: Run the comprehensive debiasing verification test
+    gyro_calibration_test(my_imus, 2);
+    
+    // Re-setup target config for the final running loop
+    for(int i=0; i<2; i++) {
+        setup_imu(&my_imus[i], RUN_ACCEL, RUN_GYRO, RUN_DLPF, RUN_RATE);
+        load_calibration(&my_imus[i]);
+    }
+
+    printf("Running Sensors at target rate. Press Ctrl+C to stop.\n");
     sleep(1); 
     
     int counter = 0;
